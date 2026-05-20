@@ -24,5 +24,6 @@ class Corner(Base):
     end_sec: Mapped[float] = mapped_column(Float, nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
 
     video: Mapped[Video] = relationship("Video", back_populates="corners")

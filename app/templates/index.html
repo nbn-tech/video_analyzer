@@ -4,33 +4,73 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Video Corner Analyzer</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/style.css?v=20260417a" />
   </head>
   <body>
     <main class="container">
       <h1>動画コーナー解析</h1>
-      <p>動画をアップロードすると、Whisperで文字起こししてGeminiでコーナー分類します。</p>
+      <p>動画をアップロードすると、白黒化した映像と音声/OCRの文字情報からコーナー分類を行います。</p>
 
       <form id="upload-form">
         <input type="file" id="video-file" name="file" accept="video/*" required />
-        <button type="submit">アップロードして解析</button>
+        <div class="button-group">
+          <button type="submit" id="btn-ocr" data-mode="ocr">OCR解析</button>
+          <button type="submit" id="btn-vision" data-mode="vision">Vision解析</button>
+        </div>
       </form>
 
       <p id="status"></p>
 
-      <table id="result-table" hidden>
-        <thead>
-          <tr>
-            <th>開始時間(sec)</th>
-            <th>終了時間(sec)</th>
-            <th>コーナータイトル</th>
-            <th>概要</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <section id="meta" hidden>
+        <h2>処理情報</h2>
+        <div id="meta-content"></div>
+      </section>
+
+      <section id="corners" hidden>
+        <h2>コーナー分類</h2>
+        <table id="result-table">
+          <thead>
+            <tr>
+              <th>開始</th>
+              <th>終了</th>
+              <th>タイトル</th>
+              <th>概要</th>
+              <th>タグ</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="audio" hidden>
+        <h2>Whisper 文字起こし（チャンク統合後）</h2>
+        <table id="audio-table">
+          <thead>
+            <tr>
+              <th>開始 (sec)</th>
+              <th>終了 (sec)</th>
+              <th>テキスト</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="ocr" hidden>
+        <h2>PaddleOCR 抽出テキスト</h2>
+        <table id="ocr-table">
+          <thead>
+            <tr>
+              <th>開始 (sec)</th>
+              <th>終了 (sec)</th>
+              <th>テキスト</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260417a"></script>
   </body>
 </html>

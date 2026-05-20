@@ -20,3 +20,14 @@ app/data/*.sqlite*
 .DS_Store
 .vscode/
 .idea/
+
+# local / generated files
+.claude/
+test_movie/
+app/data/cache/
+app/data/debug_payloads/
+*.mp4
+*.avi
+*.mov
+*.pt
+.venv/
