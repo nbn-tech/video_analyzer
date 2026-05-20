@@ -31,3 +31,4 @@ app/data/debug_payloads/
 *.mov
 *.pt
 .venv/
+video_analyzer.egg-info/
