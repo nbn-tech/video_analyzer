@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     vision_frame_interval_sec: float = 10.0
     vision_max_frames: int = 50
 
+    paddle_pdx_home: str = ""
+
     database_url: str = "sqlite:///./app/data/video_analyzer.db"
 
     model_config = SettingsConfigDict(

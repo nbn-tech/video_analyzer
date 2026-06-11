@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,6 +8,12 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+
+from app.config import settings
+
+if settings.paddle_pdx_home:
+    os.environ.setdefault("PADDLE_PDX_HOME", settings.paddle_pdx_home)
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", settings.paddle_pdx_home)
 
 from app.database import Base, engine, get_db
 from app.models import Corner, Video
@@ -27,7 +34,7 @@ Base.metadata.create_all(bind=engine)
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @app.post("/api/upload", response_model=UploadResponse)

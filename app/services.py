@@ -58,6 +58,8 @@ _WHISPER_MODEL_CACHE: dict[str, object] = {}
 _PADDLE_OCR = None
 _PADDLE_IMPORT_WARNED = False
 _PADDLE_DISABLED = False
+_EASY_OCR = None
+_EASY_OCR_WARNED = False
 
 
 def _resolve_whisper_device() -> str:
@@ -404,7 +406,7 @@ def _token_quality_ok(text: str) -> bool:
     if settings.ocr_japanese_only:
         if jp_count < 2:
             return False
-        if jp_ratio < max(float(settings.ocr_text_min_japanese_ratio), 0.6):
+        if jp_ratio < max(float(settings.ocr_text_min_japanese_ratio), 0.05):
             return False
     else:
         if jp_ratio < float(settings.ocr_text_min_japanese_ratio):
@@ -527,6 +529,88 @@ def _get_paddle_ocr():
     return _PADDLE_OCR
 
 
+def _resolve_easy_ocr_gpu() -> bool:
+    configured = settings.ocr_use_gpu.lower().strip()
+    if configured in {"true", "1", "yes"}:
+        return True
+    if configured in {"false", "0", "no"}:
+        return False
+    try:
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _get_easy_ocr():
+    global _EASY_OCR, _EASY_OCR_WARNED
+    if _EASY_OCR is not None:
+        return _EASY_OCR
+    try:
+        import easyocr  # type: ignore
+    except ImportError:
+        if not _EASY_OCR_WARNED:
+            logger.warning("EasyOCR unavailable. Install with: pip install easyocr")
+            _EASY_OCR_WARNED = True
+        return None
+    try:
+        gpu = _resolve_easy_ocr_gpu()
+        _EASY_OCR = easyocr.Reader(["ja", "en"], gpu=gpu)
+        logger.info("EasyOCR initialized (gpu=%s)", gpu)
+    except Exception:
+        logger.exception("EasyOCR initialization failed.")
+        _EASY_OCR = None
+    return _EASY_OCR
+
+
+def _ocr_regions_easy(image_path: str) -> list[dict]:
+    reader = _get_easy_ocr()
+    if reader is None:
+        return []
+    try:
+        raw = reader.readtext(image_path)
+    except Exception:
+        logger.debug("EasyOCR readtext failed", exc_info=True)
+        return []
+
+    regions: list[dict] = []
+    n_score = n_quality = n_box = n_telop = 0
+    for item in raw or []:
+        if not item or len(item) < 3:
+            continue
+        box, text, score = item[0], str(item[1]).strip(), float(item[2])
+        if score < float(settings.ocr_paddle_min_score):
+            n_score += 1
+            continue
+        if not _token_quality_ok(text):
+            n_quality += 1
+            logger.debug("quality_drop score=%.2f text=%r", score, text[:40])
+            continue
+        if not _paddle_box_wh_ok(box):
+            n_box += 1
+            continue
+        cleaned = _clean_ocr_token(text)
+        if not cleaned:
+            continue
+        try:
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+            x, y = min(xs), min(ys)
+            width, height = max(xs) - x, max(ys) - y
+        except Exception:
+            continue
+        if not _is_telop_like_region(x, y, width, height):
+            n_telop += 1
+            continue
+        regions.append({"x": x, "y": y, "w": width, "h": height, "text": cleaned, "score": score})
+
+    if raw:
+        print(f"[easy_ocr_filter] total={len(raw)} pass={len(regions)} "
+              f"drop_score={n_score} drop_quality={n_quality} drop_box={n_box} drop_telop={n_telop}")
+    regions.sort(key=lambda r: (r["y"], r["x"]))
+    return regions
+
+
 def _text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -555,29 +639,29 @@ def _ocr_regions_paddle(image_path: str) -> list[dict]:
     if ocr is None:
         return []
     try:
-        result = ocr.ocr(image_path, cls=True)
+        results = ocr.predict(image_path)
     except Exception:
+        logger.warning("PaddleOCR predict failed", exc_info=True)
         return []
 
     regions: list[dict] = []
-    for line in result or []:
-        if not line:
+    for res in results or []:
+        if res is None:
             continue
-        for item in line:
-            if not item or len(item) < 2:
-                continue
-            box = item[0]
-            rec = item[1]
-            if not _paddle_box_wh_ok(box):
-                continue
-            if not isinstance(rec, (list, tuple)) or not rec:
-                continue
+        try:
+            rec_texts = res["rec_texts"]
+            rec_scores = res["rec_scores"]
+            dt_polys = res["dt_polys"]
+        except (TypeError, KeyError):
+            continue
 
-            text = str(rec[0]).strip()
-            score = float(rec[1]) if len(rec) > 1 else 0.0
-            if score < float(settings.ocr_paddle_min_score):
+        for text, score, box in zip(rec_texts or [], rec_scores or [], dt_polys or []):
+            if float(score) < float(settings.ocr_paddle_min_score):
                 continue
+            text = str(text).strip()
             if not _token_quality_ok(text):
+                continue
+            if not _paddle_box_wh_ok(box):
                 continue
 
             cleaned = _clean_ocr_token(text)
@@ -642,11 +726,12 @@ def _ocr_image_text_tesseract(image_path: str, psm: int = 6) -> str:
 
 def _ocr_frame_regions(frame_image_path: str) -> list[dict]:
     engine = settings.ocr_engine.lower().strip()
+    if engine == "easyocr":
+        return _ocr_regions_easy(frame_image_path)
     if engine == "paddleocr":
         regions = _ocr_regions_paddle(frame_image_path)
         if regions:
             return regions
-        # If PaddleOCR is unavailable or produced nothing, fall back to tesseract per frame.
         text = _ocr_image_text_tesseract(frame_image_path, psm=6)
         cleaned = _clean_ocr_token(text)
         if len(cleaned) < int(settings.ocr_min_chars):
@@ -746,7 +831,7 @@ def _extract_ocr_rows(video_path: Path) -> list[dict]:
         return []
 
     engine = settings.ocr_engine.lower().strip()
-    if engine != "paddleocr":
+    if engine == "tesseract":
         if shutil.which(settings.ocr_tesseract_cmd) is None:
             logger.warning("OCR skipped: tesseract command not found (%s)", settings.ocr_tesseract_cmd)
             return []
