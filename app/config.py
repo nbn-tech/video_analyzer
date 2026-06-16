@@ -48,6 +48,15 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./app/data/video_analyzer.db"
 
+    # AWS
+    aws_region: str = "ap-northeast-1"
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    s3_bucket: str = ""
+    s3_input_prefix: str = "videos/"
+    s3_output_prefix: str = "results/"
+    sqs_queue_url: str = ""
+
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
