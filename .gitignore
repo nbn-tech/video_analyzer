@@ -9,6 +9,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.body
 
 # Local runtime artifacts
 app/uploads/*
@@ -32,3 +33,6 @@ app/data/debug_payloads/
 *.pt
 .venv/
 video_analyzer.egg-info/
+paddleocr_models/
+paddlex_models/
+pip_cache/

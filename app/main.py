@@ -1,5 +1,6 @@
 import json
 import os
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 from pathlib import Path
 from uuid import uuid4
 

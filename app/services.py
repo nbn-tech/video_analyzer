@@ -54,10 +54,13 @@ tags rules:
 - Short and specific (1-4 characters each preferred)
 """.strip()
 
+import threading
+
 _WHISPER_MODEL_CACHE: dict[str, object] = {}
 _PADDLE_OCR = None
 _PADDLE_IMPORT_WARNED = False
 _PADDLE_DISABLED = False
+_PADDLE_OCR_LOCK = threading.Lock()
 _EASY_OCR = None
 _EASY_OCR_WARNED = False
 
@@ -361,23 +364,25 @@ def _normalize_ocr_text(text: str) -> str:
 def _is_japanese_char(ch: str) -> bool:
     code = ord(ch)
     return (
-        0x3040 <= code <= 0x30FF
-        or 0x4E00 <= code <= 0x9FFF
+        0x3040 <= code <= 0x30FF   # ひらがな・カタカナ
+        or 0x4E00 <= code <= 0x9FFF  # 漢字
         or code == 0x3005
+        or 0x3000 <= code <= 0x303F  # 「」『』【】、。・ など
     )
 
 
 def _clean_ocr_token(text: str) -> str:
     text = text.replace("\x0c", " ")
+    # \u3000-\u303F = CJK\u8A18\u53F7\u30FB\u53E5\u8AAD\u70B9\uFF08\u300C\u300D\u300E\u300F\u3010\u3011\u3001\u3002\u30FB\u306A\u3069\uFF09
     if settings.ocr_japanese_only:
         text = re.sub(
-            r"[^\u3040-\u30FF\u4E00-\u9FFF0-9A-Za-z\s\-_/:\.,!?()]+",
+            r"[^\u3040-\u30FF\u4E00-\u9FFF\u3000-\u303F0-9A-Za-z\s\-_/:\.,!?()]+",
             " ",
             text,
         )
     else:
         text = re.sub(
-            r"[^\u3040-\u30FF\u4E00-\u9FFFA-Za-z0-9\s\-_/:\.,!?()]+",
+            r"[^\u3040-\u30FF\u4E00-\u9FFF\u3000-\u303FA-Za-z0-9\s\-_/:\.,!?()]+",
             " ",
             text,
         )
@@ -404,7 +409,7 @@ def _token_quality_ok(text: str) -> bool:
     jp_count = sum(1 for ch in cleaned_compact if _is_japanese_char(ch))
     jp_ratio = jp_count / max(len(cleaned_compact), 1)
     if settings.ocr_japanese_only:
-        if jp_count < 2:
+        if jp_count < 1:
             return False
         if jp_ratio < max(float(settings.ocr_text_min_japanese_ratio), 0.05):
             return False
@@ -470,62 +475,34 @@ def _get_paddle_ocr():
         return None
     if _PADDLE_OCR is not None:
         return _PADDLE_OCR
-    try:
-        from paddleocr import PaddleOCR  # type: ignore
-    except Exception:
-        if not _PADDLE_IMPORT_WARNED:
-            logger.warning("PaddleOCR unavailable. Install with: pip install paddleocr paddlepaddle")
-            _PADDLE_IMPORT_WARNED = True
-        return None
-
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-    device = _resolve_ocr_device()
-    try:
-        # PaddleOCR 3.x style
-        _PADDLE_OCR = PaddleOCR(lang="japan", use_textline_orientation=True, device=device)
-    except Exception as e:
-        message = str(e)
-        if "Unknown argument: device" in message:
-            try:
-                # PaddleOCR 2.x style
-                use_gpu = device.startswith("gpu")
-                _PADDLE_OCR = PaddleOCR(lang="japan", use_textline_orientation=True, use_gpu=use_gpu)
-                return _PADDLE_OCR
-            except Exception as retry_e:
-                if "Unknown argument: use_textline_orientation" in str(retry_e):
-                    try:
-                        _PADDLE_OCR = PaddleOCR(lang="japan", use_angle_cls=True, use_gpu=use_gpu)
-                        return _PADDLE_OCR
-                    except Exception:
-                        logger.exception("PaddleOCR initialization failed after fallback retries.")
-                        _PADDLE_OCR = None
-                        _PADDLE_DISABLED = True
-                        return _PADDLE_OCR
-                logger.exception("PaddleOCR initialization failed after removing unsupported use_gpu arg.")
-                _PADDLE_OCR = None
-                _PADDLE_DISABLED = True
-                return _PADDLE_OCR
-        if "Unknown argument: use_textline_orientation" in str(e):
-            try:
-                _PADDLE_OCR = PaddleOCR(lang="japan", use_angle_cls=True, device=device)
-                return _PADDLE_OCR
-            except Exception:
-                logger.exception("PaddleOCR initialization failed after retry. Falling back to tesseract.")
-                _PADDLE_OCR = None
-                _PADDLE_DISABLED = True
-                return _PADDLE_OCR
-        logger.exception("PaddleOCR initialization failed. Falling back to tesseract.")
-        _PADDLE_OCR = None
-        _PADDLE_DISABLED = True
-        return _PADDLE_OCR
-    except TypeError:
+    with _PADDLE_OCR_LOCK:
+        if _PADDLE_OCR is not None:
+            return _PADDLE_OCR
         try:
-            _PADDLE_OCR = PaddleOCR(lang="japan", use_angle_cls=True, device=device)
+            from paddleocr import PaddleOCR  # type: ignore
         except Exception:
-            logger.exception("PaddleOCR initialization failed after TypeError fallback.")
+            if not _PADDLE_IMPORT_WARNED:
+                logger.warning("PaddleOCR unavailable. Install with: pip install paddleocr==2.9.1 paddlepaddle-gpu==2.6.2")
+                _PADDLE_IMPORT_WARNED = True
+            return None
+
+        model_root = str(Path(__file__).resolve().parent.parent / "paddleocr_models")
+        use_gpu = _resolve_ocr_device().startswith("gpu")
+        try:
+            _PADDLE_OCR = PaddleOCR(
+                lang="japan",
+                use_angle_cls=False,
+                use_gpu=use_gpu,
+                show_log=False,
+                det_model_dir=str(Path(model_root) / "det"),
+                rec_model_dir=str(Path(model_root) / "rec"),
+                cls_model_dir=str(Path(model_root) / "cls"),
+            )
+            logger.info("PaddleOCR 2.x initialized (gpu=%s)", use_gpu)
+        except Exception:
+            logger.exception("PaddleOCR initialization failed.")
             _PADDLE_OCR = None
             _PADDLE_DISABLED = True
-    logger.info("PaddleOCR initialized with device=%s", device)
     return _PADDLE_OCR
 
 
@@ -607,8 +584,7 @@ def _ocr_regions_easy(image_path: str) -> list[dict]:
     if raw:
         print(f"[easy_ocr_filter] total={len(raw)} pass={len(regions)} "
               f"drop_score={n_score} drop_quality={n_quality} drop_box={n_box} drop_telop={n_telop}")
-    regions.sort(key=lambda r: (r["y"], r["x"]))
-    return regions
+    return _merge_same_line_regions(regions)
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -627,11 +603,46 @@ def _is_telop_like_region(x: float, y: float, width: float, height: float) -> bo
     if width * height < 1200:
         return False
 
-    # Prefer text-like regions but keep this fairly permissive.
-    if width / max(height, 1.0) < 1.2:
+    # 単一文字（括弧など）は正方形に近いので縦長でなければ許容する
+    if width / max(height, 1.0) < 0.3:
         return False
 
     return True
+
+
+def _merge_same_line_regions(regions: list[dict]) -> list[dict]:
+    if len(regions) <= 1:
+        return regions
+
+    lines: list[list[dict]] = []
+    for region in sorted(regions, key=lambda r: (r["y"], r["x"])):
+        placed = False
+        for line in lines:
+            ref = line[-1]
+            ref_cy = ref["y"] + ref["h"] / 2
+            cur_cy = region["y"] + region["h"] / 2
+            same_row = abs(ref_cy - cur_cy) < max(ref["h"], region["h"]) * 0.6
+            # 直前ボックスの右端から現在ボックスの左端までのX距離
+            x_gap = region["x"] - (ref["x"] + ref["w"])
+            close_enough = x_gap < max(ref["h"], region["h"]) * 2.0
+            if same_row and close_enough:
+                line.append(region)
+                placed = True
+                break
+        if not placed:
+            lines.append([region])
+
+    result = []
+    for line in lines:
+        line.sort(key=lambda r: r["x"])
+        text = " ".join(r["text"] for r in line).strip()
+        x = min(r["x"] for r in line)
+        y = min(r["y"] for r in line)
+        w = max(r["x"] + r["w"] for r in line) - x
+        h = max(r["h"] for r in line)
+        score = max(r["score"] for r in line)
+        result.append({"x": x, "y": y, "w": w, "h": h, "text": text, "score": score})
+    return result
 
 
 def _ocr_regions_paddle(image_path: str) -> list[dict]:
@@ -639,61 +650,46 @@ def _ocr_regions_paddle(image_path: str) -> list[dict]:
     if ocr is None:
         return []
     try:
-        results = ocr.predict(image_path)
+        with _PADDLE_OCR_LOCK:
+            result = ocr.ocr(image_path, cls=False)
     except Exception:
-        logger.warning("PaddleOCR predict failed", exc_info=True)
+        logger.warning("PaddleOCR ocr() failed", exc_info=True)
         return []
 
     regions: list[dict] = []
-    for res in results or []:
-        if res is None:
+    for line in result or []:
+        if not line:
             continue
-        try:
-            rec_texts = res["rec_texts"]
-            rec_scores = res["rec_scores"]
-            dt_polys = res["dt_polys"]
-        except (TypeError, KeyError):
-            continue
-
-        for text, score, box in zip(rec_texts or [], rec_scores or [], dt_polys or []):
-            if float(score) < float(settings.ocr_paddle_min_score):
+        for item in line:
+            if not item or len(item) < 2:
                 continue
-            text = str(text).strip()
-            if not _token_quality_ok(text):
-                continue
+            box = item[0]
+            rec = item[1]
             if not _paddle_box_wh_ok(box):
                 continue
-
+            if not isinstance(rec, (list, tuple)) or not rec:
+                continue
+            text = str(rec[0]).strip()
+            score = float(rec[1]) if len(rec) > 1 else 0.0
+            if score < float(settings.ocr_paddle_min_score):
+                continue
+            if not _token_quality_ok(text):
+                continue
             cleaned = _clean_ocr_token(text)
             if not cleaned:
                 continue
-
             try:
                 xs = [float(p[0]) for p in box]
                 ys = [float(p[1]) for p in box]
-                x = min(xs)
-                y = min(ys)
-                width = max(xs) - x
-                height = max(ys) - y
+                x, y = min(xs), min(ys)
+                width, height = max(xs) - x, max(ys) - y
             except Exception:
                 continue
-
             if not _is_telop_like_region(x, y, width, height):
                 continue
+            regions.append({"x": x, "y": y, "w": width, "h": height, "text": cleaned, "score": score})
 
-            regions.append(
-                {
-                    "x": x,
-                    "y": y,
-                    "w": width,
-                    "h": height,
-                    "text": cleaned,
-                    "score": score,
-                }
-            )
-
-    regions.sort(key=lambda r: (r["y"], r["x"]))
-    return regions
+    return _merge_same_line_regions(regions)
 
 
 def _ocr_image_text_tesseract(image_path: str, psm: int = 6) -> str:
