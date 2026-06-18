@@ -51,9 +51,7 @@ async def upload_video(file: UploadFile = File(...), db: Session = Depends(get_d
     db.add(video)
     db.flush()
 
-    processed_video = create_grayscale_video(target)
-    transcript = transcribe_video(processed_video)
-    analyzed = segment_corners(transcript, processed_video)
+    analyzed = segment_corners(target)
     corners = analyzed["corners"]
 
     db_corners: list[Corner] = []
@@ -74,7 +72,7 @@ async def upload_video(file: UploadFile = File(...), db: Session = Depends(get_d
     return UploadResponse(
         video_id=video.id,
         filename=video.filename,
-        processed_filename=processed_video.name if processed_video.exists() else None,
+        processed_filename=None,
         corners=[
             CornerResponse(
                 start_sec=row.start_sec,

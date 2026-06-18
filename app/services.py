@@ -13,6 +13,7 @@ from pathlib import Path
 import google.generativeai as genai
 import whisper
 from PIL import Image
+from tqdm import tqdm
 
 from app.config import settings
 
@@ -29,9 +30,9 @@ Rules:
 - One corner should contain one topic.
 - Merge ALL weather forecast content (local weather, regional forecast, weekend forecast, weekly forecast, weather map, etc.) into one single corner titled "天気予報". Do not split weather into multiple corners.
 - Separate unrelated topics into separate corners.
-- In news programs, treat each individual news story as a separate corner, even if short.
+- In news programs, each news story that covers a different subject or event MUST be a separate corner. Do NOT merge two different news stories into one corner even if they appear back to back. When the topic changes (different event, different person, different location), always start a new corner.
 - Studio commentary or reactions about the same news story should be merged into the same corner as that story, not split off.
-- Sponsored segments (プレゼント, CM, お知らせ) should be their own corner, separate from any following news, even if very short (under 30 seconds).
+- CM and commercial breaks: merge ALL consecutive CM segments into a single corner. Set the title to "CM" and the summary to "CM中". Do not describe CM content.
 - Keep boundaries near candidate timestamps when possible.
 - Use OCR rows to supplement named entities, rankings, scores, and on-screen labels not captured in audio.
 - OCR rows may contain noise; prioritize Japanese text and discard short or garbled tokens.
@@ -262,10 +263,16 @@ def transcribe_video(video_path: Path) -> dict:
         ]
 
         if max_workers == 1:
-            parts = [_transcribe_chunk_job(*job) for job in jobs]
+            parts = [
+                _transcribe_chunk_job(*job)
+                for job in tqdm(jobs, desc="Whisper", unit="chunk")
+            ]
         else:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                parts = list(executor.map(_transcribe_chunk_job_from_tuple, jobs))
+                parts = list(tqdm(
+                    executor.map(_transcribe_chunk_job_from_tuple, jobs),
+                    total=len(jobs), desc="Whisper", unit="chunk",
+                ))
 
         parts.sort(key=lambda p: p["index"])
 
@@ -855,12 +862,13 @@ def _extract_ocr_rows(video_path: Path) -> list[dict]:
             "-i",
             str(video_path),
             "-vf",
-            f"fps={fps},scale=iw*1.5:ih*1.5,eq=contrast=1.4:brightness=0.02",
+            f"fps={fps},format=gray,scale=iw*1.5:ih*1.5,eq=contrast=1.4:brightness=0.02",
             str(frame_pattern),
         ]
 
         try:
-            subprocess.run(ffmpeg_cmd, check=True)
+            with tqdm(desc="ffmpeg (フレーム抽出)", unit="s", bar_format="{desc}: {elapsed} 経過") as _:
+                subprocess.run(ffmpeg_cmd, check=True)
         except Exception:
             return []
 
@@ -872,10 +880,16 @@ def _extract_ocr_rows(video_path: Path) -> list[dict]:
         max_workers = max(1, min(int(settings.ocr_parallel_workers), frame_count))
         frame_jobs = [str(frame_file) for frame_file in frame_files]
         if max_workers == 1:
-            frame_regions = [_ocr_frame_regions(frame_path) for frame_path in frame_jobs]
+            frame_regions = [
+                _ocr_frame_regions(p)
+                for p in tqdm(frame_jobs, desc="OCR", unit="frame")
+            ]
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                frame_regions = list(executor.map(_ocr_frame_regions, frame_jobs))
+                frame_regions = list(tqdm(
+                    executor.map(_ocr_frame_regions, frame_jobs),
+                    total=frame_count, desc="OCR", unit="frame",
+                ))
 
         raw_rows: list[dict] = []
         for idx, regions in enumerate(frame_regions):
@@ -1128,9 +1142,14 @@ def segment_corners_vision(transcript: dict, video_path: Path) -> dict:
     }
 
 
-def segment_corners(transcript: dict, video_path: Path | None = None) -> dict:
+def segment_corners(video_path: Path) -> dict:
+    """Whisper文字起こしとOCRを並列実行してからGeminiでコーナー分類する。"""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        audio_future = ex.submit(transcribe_video, video_path)
+        ocr_future = ex.submit(_extract_ocr_rows, video_path)
+        transcript = audio_future.result()
+        ocr_rows = ocr_future.result()
     audio_rows = _segment_rows(transcript)
-    ocr_rows = _extract_ocr_rows(video_path) if video_path else []
     print(f"[segment_corners] audio_rows={len(audio_rows)} ocr_rows={len(ocr_rows)}")
 
     if not settings.gemini_api_key:

@@ -53,8 +53,9 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     s3_bucket: str = ""
-    s3_input_prefix: str = "videos/"
+    s3_input_prefix: str = "movie/ch1/"
     s3_output_prefix: str = "results/"
+    s3_output_station: str = "nbn"
     sqs_queue_url: str = ""
 
     model_config = SettingsConfigDict(

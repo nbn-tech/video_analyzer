@@ -29,7 +29,7 @@ if settings.paddle_pdx_home:
     os.environ.setdefault("PADDLE_PDX_HOME", settings.paddle_pdx_home)
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", settings.paddle_pdx_home)
 
-from app.services import create_grayscale_video, segment_corners, transcribe_video
+from app.services import segment_corners
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +67,22 @@ def _corners_to_csv(filename: str, corners: list[dict]) -> str:
     return buf.getvalue()
 
 
+def _build_output_key(s3_key: str) -> str:
+    """
+    入力キーから出力CSVキーを生成する。
+
+    movie/ch1/20260617/video.mp4
+      → results/nbn/20260617/video_corners.csv
+    """
+    parts = s3_key.split("/")
+    # 動画直上のディレクトリを日付として使う
+    date_dir = parts[-2] if len(parts) >= 2 else "unknown"
+    stem = Path(s3_key).stem
+    base = settings.s3_output_prefix.rstrip("/")
+    station = settings.s3_output_station.strip("/")
+    return f"{base}/{station}/{date_dir}/{stem}_corners.csv"
+
+
 def _process_s3_object(s3_key: str) -> None:
     boto_kwargs = _build_boto_kwargs()
     s3 = boto3.client("s3", **boto_kwargs)
@@ -84,17 +100,14 @@ def _process_s3_object(s3_key: str) -> None:
         s3.download_file(settings.s3_bucket, s3_key, str(local_video))
         log.info("ダウンロード完了: %s", local_video)
 
-        processed = create_grayscale_video(local_video)
-        transcript = transcribe_video(processed)
-        analyzed = segment_corners(transcript, processed)
+        analyzed = segment_corners(local_video)
 
         corners = analyzed.get("corners", [])
         log.info("コーナー数: %d", len(corners))
 
         csv_content = _corners_to_csv(Path(s3_key).name, corners)
 
-        stem = Path(s3_key).stem
-        output_key = f"{settings.s3_output_prefix.rstrip('/')}/{stem}_corners.csv"
+        output_key = _build_output_key(s3_key)
         s3.put_object(
             Bucket=settings.s3_bucket,
             Key=output_key,
