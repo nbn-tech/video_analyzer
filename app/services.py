@@ -34,6 +34,7 @@ Rules:
 - Studio commentary or reactions about the same news story should be merged into the same corner as that story, not split off.
 - CM and commercial breaks: merge ALL consecutive CM segments into a single corner. Set the title to "CM" and the summary to "CM中". Do not describe CM content.
 - Keep boundaries near candidate timestamps when possible.
+- The corners must cover the ENTIRE video duration with NO gaps. Every second of the video must belong to exactly one corner. The end_sec of each corner must equal the start_sec of the next corner.
 - Use OCR rows to supplement named entities, rankings, scores, and on-screen labels not captured in audio.
 - OCR rows may contain noise; prioritize Japanese text and discard short or garbled tokens.
 - Whisper transcriptions may contain recognition errors (e.g., wrong kanji homonyms). When OCR rows show more accurate text for the same timeframe, use the OCR text to produce correct, natural Japanese in titles and summaries. Do not blindly copy Whisper errors into summaries.
@@ -168,8 +169,11 @@ def _transcribe_chunk_job(
         language=language,
         beam_size=beam_size,
         best_of=best_of,
-        temperature=temperature,
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         fp16=_resolve_whisper_fp16(_resolve_whisper_device()),
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=2.4,
     )
     return {
         "index": chunk_index,
@@ -196,8 +200,11 @@ def transcribe_video(video_path: Path) -> dict:
             language=language,
             beam_size=settings.whisper_beam_size,
             best_of=settings.whisper_best_of,
-            temperature=settings.whisper_temperature,
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
             fp16=_resolve_whisper_fp16(_resolve_whisper_device()),
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
         )
 
     with tempfile.TemporaryDirectory(prefix="whisper_chunks_") as tmp_dir:
@@ -232,8 +239,11 @@ def transcribe_video(video_path: Path) -> dict:
                 language=language,
                 beam_size=settings.whisper_beam_size,
                 best_of=settings.whisper_best_of,
-                temperature=settings.whisper_temperature,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                 fp16=_resolve_whisper_fp16(_resolve_whisper_device()),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
             )
 
         chunk_files = sorted(tmp_path.glob("chunk_*.wav"))
@@ -243,8 +253,11 @@ def transcribe_video(video_path: Path) -> dict:
                 language=language,
                 beam_size=settings.whisper_beam_size,
                 best_of=settings.whisper_best_of,
-                temperature=settings.whisper_temperature,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                 fp16=_resolve_whisper_fp16(_resolve_whisper_device()),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
             )
 
         max_workers = max(1, min(workers, len(chunk_files)))
@@ -345,7 +358,17 @@ def _segment_rows(transcript: dict) -> list[dict]:
                 "text": text,
             }
         )
-    return rows
+
+    # 連続する同一テキスト（Whisperハルシネーション）を1行にまとめる
+    if not rows:
+        return rows
+    deduped: list[dict] = [rows[0]]
+    for row in rows[1:]:
+        if row["text"] == deduped[-1]["text"]:
+            deduped[-1]["end_sec"] = row["end_sec"]
+        else:
+            deduped.append(row)
+    return deduped
 
 
 def _boundary_candidates(rows: list[dict]) -> list[float]:
@@ -487,9 +510,9 @@ def _get_paddle_ocr():
             return _PADDLE_OCR
         try:
             from paddleocr import PaddleOCR  # type: ignore
-        except Exception:
+        except Exception as e:
             if not _PADDLE_IMPORT_WARNED:
-                logger.warning("PaddleOCR unavailable. Install with: pip install paddleocr==2.9.1 paddlepaddle-gpu==2.6.2")
+                logger.warning("PaddleOCR import failed: %s", e, exc_info=True)
                 _PADDLE_IMPORT_WARNED = True
             return None
 
@@ -981,6 +1004,11 @@ def _normalize_corners(corners: list[dict], rows: list[dict]) -> list[dict]:
                 continue
         merged.append(cur)
 
+    # 前のコーナーを次の開始時刻まで延ばしてギャップを埋める
+    for i in range(len(merged) - 1):
+        if merged[i + 1]["start_sec"] > merged[i]["end_sec"]:
+            merged[i]["end_sec"] = merged[i + 1]["start_sec"]
+
     merged[0]["start_sec"] = min_t
     merged[-1]["end_sec"] = max_t
     return merged
@@ -1183,7 +1211,18 @@ def segment_corners(video_path: Path) -> dict:
             "corners": _fallback_segments(transcript),
             "audio_rows": audio_rows,
             "ocr_rows": ocr_rows,
+            "gemini_usage": None,
         }
+
+    usage = getattr(response, "usage_metadata", None)
+    gemini_usage = None
+    if usage is not None:
+        gemini_usage = {
+            "input_tokens": getattr(usage, "prompt_token_count", 0),
+            "output_tokens": getattr(usage, "candidates_token_count", 0),
+            "total_tokens": getattr(usage, "total_token_count", 0),
+        }
+        print(f"[gemini_usage] {gemini_usage}")
 
     raw = (response.text or "").strip()
 
@@ -1199,6 +1238,7 @@ def segment_corners(video_path: Path) -> dict:
                 "corners": _fallback_segments(transcript),
                 "audio_rows": audio_rows,
                 "ocr_rows": ocr_rows,
+                "gemini_usage": gemini_usage,
             }
 
     normalized = _normalize_corners(parsed, audio_rows)
@@ -1209,4 +1249,5 @@ def segment_corners(video_path: Path) -> dict:
         "corners": normalized,
         "audio_rows": audio_rows,
         "ocr_rows": ocr_rows,
+        "gemini_usage": gemini_usage,
     }

@@ -46,6 +46,13 @@ class Settings(BaseSettings):
 
     paddle_pdx_home: str = ""
 
+    # Gemini料金設定（変動するので必要に応じて.env.localで上書き）
+    # gemini-2.5-flash 公式レート (USD/1Mトークン)
+    gemini_input_price_usd_per_1m: float = 0.30
+    gemini_output_price_usd_per_1m: float = 2.50
+    gemini_thinking_price_usd_per_1m: float = 3.50  # 思考トークン
+    usd_to_jpy: float = 150.0
+
     database_url: str = "sqlite:///./app/data/video_analyzer.db"
 
     # AWS
