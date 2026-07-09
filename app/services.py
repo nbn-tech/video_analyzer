@@ -207,7 +207,7 @@ def transcribe_video(video_path: Path) -> dict:
             compression_ratio_threshold=2.4,
         )
 
-    with tempfile.TemporaryDirectory(prefix="whisper_chunks_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="whisper_chunks_", dir="A:\\tmp") as tmp_dir:
         tmp_path = Path(tmp_dir)
         pattern = tmp_path / "chunk_%05d.wav"
         cmd = [
@@ -348,6 +348,8 @@ def _segment_rows(transcript: dict) -> list[dict]:
     for seg in transcript.get("segments", []):
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
+        no_speech_prob = seg.get("no_speech_prob")
+        logger.info("[no_speech_prob] %.1f-%.1f  prob=%.3f", start, end, no_speech_prob if no_speech_prob is not None else -1)
         if end <= start:
             continue
         text = _apply_custom_vocabulary((seg.get("text") or "").strip())
@@ -359,7 +361,6 @@ def _segment_rows(transcript: dict) -> list[dict]:
             }
         )
 
-    # 連続する同一テキスト（Whisperハルシネーション）を1行にまとめる
     if not rows:
         return rows
     deduped: list[dict] = [rows[0]]
@@ -872,7 +873,7 @@ def _extract_ocr_rows(video_path: Path) -> list[dict]:
             )
             return []
 
-    with tempfile.TemporaryDirectory(prefix="ocr_frames_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="ocr_frames_", dir="A:\\tmp") as tmp_dir:
         tmp_path = Path(tmp_dir)
         frame_pattern = tmp_path / "frame_%06d.png"
         fps = 1.0 / interval
@@ -1082,7 +1083,7 @@ def _extract_keyframes(video_path: Path) -> list[dict]:
         t += interval
 
     frames: list[dict] = []
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmp:
         tmp_path = Path(tmp)
         for ts in timestamps:
             out = tmp_path / f"frame_{ts:.1f}.jpg"

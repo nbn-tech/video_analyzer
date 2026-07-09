@@ -202,6 +202,9 @@ def _build_html_report(filename: str, corners: list[dict], audio_rows: list[dict
 </html>"""
 
 
+from app.athena import sync_glue_table
+
+
 def _process_s3_object(s3_key: str) -> None:
     boto_kwargs = _build_boto_kwargs()
     s3 = boto3.client("s3", **boto_kwargs)
@@ -213,7 +216,7 @@ def _process_s3_object(s3_key: str) -> None:
 
     log.info("処理開始: s3://%s/%s", settings.s3_bucket, s3_key)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmpdir:
         local_video = Path(tmpdir) / Path(s3_key).name
         log.info("ダウンロード中...")
         s3.download_file(settings.s3_bucket, s3_key, str(local_video))
@@ -246,6 +249,28 @@ def _process_s3_object(s3_key: str) -> None:
             ContentType="text/html; charset=utf-8",
         )
         log.info("HTML出力完了: s3://%s/%s", settings.s3_bucket, html_key)
+
+        try:
+            for i, corner in enumerate(corners):
+                tags_str = "|".join(corner.get("tags", [])) if isinstance(corner.get("tags"), list) else str(corner.get("tags", ""))
+                buf = io.StringIO()
+                csv.writer(buf).writerow([
+                    f"{corner['start_sec']:.3f}",
+                    f"{corner['end_sec']:.3f}",
+                    corner.get("title", ""),
+                    corner.get("summary", ""),
+                    tags_str,
+                ])
+                s3.put_object_annotation(
+                    Bucket=settings.s3_bucket,
+                    Key=s3_key,
+                    AnnotationName=f"corner_{i:04d}",
+                    AnnotationPayload=buf.getvalue().strip().encode("utf-8"),
+                )
+            log.info("アノテーション付与完了: %d件 s3://%s/%s", len(corners), settings.s3_bucket, s3_key)
+            sync_glue_table()
+        except Exception as e:
+            log.warning("アノテーション付与失敗（boto3未対応の可能性）: %s", e)
 
 
 def _parse_s3_records(body: str) -> list[str]:

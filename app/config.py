@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
 
     whisper_model: str = "small"
-    whisper_chunk_sec: int = 60
+    whisper_chunk_sec: int = 30
     whisper_parallel_workers: int = 3
     whisper_language: str = "auto"
     whisper_device: str = "auto"
@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     s3_output_prefix: str = "results/"
     s3_output_station: str = "nbn"
     sqs_queue_url: str = ""
+    athena_output_location: str = ""
+    athena_glue_db: str = "bangumi_annotations"
+    athena_glue_table: str = "annotation"
 
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.local"),
