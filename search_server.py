@@ -1,5 +1,5 @@
 """
-アノテーション検索サーバー
+動画分析結果検索サーバー
 
 起動方法:
     .venv/Scripts/python search_server.py
@@ -10,36 +10,52 @@ http://localhost:8000 でブラウザから検索できる。
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse
 from app.athena import run_athena_query
+from app.config import settings
 
 app = FastAPI(title="番組検索")
 
 
 @app.get("/search")
-def search(q: str = Query(..., description="検索キーワード")):
-    """アノテーションからキーワード検索し、動画名・開始・終了時刻を返す"""
+def search(
+    q: str = Query(..., description="検索キーワード"),
+    channel: str = Query("ch6", pattern=r"^ch[0-9]+$"),
+    day_of_week: str | None = Query(None, pattern=r"^(mon|tue|wed|thu|fri|sat|sun)$"),
+):
+    """分析結果からキーワード検索し、動画名・開始・終了時刻を返す。"""
     safe_q = q.replace("'", "''")
+    table = f'"{settings.athena_glue_db}"."{settings.athena_glue_table}"'
+    weekday_filter = f"AND day_of_week = '{day_of_week}'" if day_of_week else ""
     sql = f"""
         SELECT
-            object_key,
-            name,
-            split_part(text_value, ',', 1) AS start_sec,
-            split_part(text_value, ',', 2) AS end_sec,
-            split_part(text_value, ',', 3) AS title,
-            split_part(text_value, ',', 4) AS summary
-        FROM {GLUE_TABLE}
-        WHERE name LIKE 'corner\_%' ESCAPE '\\'
+            broadcast_date,
+            channel,
+            filename,
+            start_sec,
+            end_sec,
+            title,
+            summary,
+            tags
+        FROM {table}
+        WHERE channel = '{channel}'
+          {weekday_filter}
           AND (
-            split_part(text_value, ',', 3) LIKE '%{safe_q}%'
-            OR split_part(text_value, ',', 4) LIKE '%{safe_q}%'
-            OR split_part(text_value, ',', 5) LIKE '%{safe_q}%'
+              title LIKE '%{safe_q}%'
+              OR summary LIKE '%{safe_q}%'
+              OR tags LIKE '%{safe_q}%'
           )
-        ORDER BY object_key, CAST(split_part(text_value, ',', 1) AS DOUBLE)
+        ORDER BY broadcast_date DESC, program_start_sec, start_sec
     """
     try:
         rows = run_athena_query(sql)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return {"keyword": q, "count": len(rows), "results": rows}
+    return {
+        "keyword": q,
+        "channel": channel,
+        "day_of_week": day_of_week,
+        "count": len(rows),
+        "results": rows,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -65,8 +81,22 @@ def index():
 </style>
 </head>
 <body>
-<h1>番組アノテーション検索</h1>
+<h1>番組分析結果検索</h1>
 <div class="search-box">
+  <select id="channel">
+    <option value="ch1">ch1</option>
+    <option value="ch6" selected>ch6</option>
+  </select>
+  <select id="day-of-week">
+    <option value="">全曜日</option>
+    <option value="mon">月曜日</option>
+    <option value="tue">火曜日</option>
+    <option value="wed">水曜日</option>
+    <option value="thu">木曜日</option>
+    <option value="fri">金曜日</option>
+    <option value="sat">土曜日</option>
+    <option value="sun">日曜日</option>
+  </select>
   <input type="text" id="q" placeholder="キーワードを入力（例：大谷）" onkeydown="if(event.key==='Enter')doSearch()">
   <button id="btn" onclick="doSearch()">検索</button>
 </div>
@@ -75,6 +105,8 @@ def index():
 <script>
 async function doSearch() {
   const q = document.getElementById('q').value.trim();
+  const channel = document.getElementById('channel').value;
+  const dayOfWeek = document.getElementById('day-of-week').value;
   if (!q) return;
   const btn = document.getElementById('btn');
   const status = document.getElementById('status');
@@ -83,14 +115,16 @@ async function doSearch() {
   status.textContent = 'Athenaクエリ実行中...';
   result.innerHTML = '';
   try {
-    const r = await fetch('/search?q=' + encodeURIComponent(q));
+    const params = new URLSearchParams({ q, channel });
+    if (dayOfWeek) params.set('day_of_week', dayOfWeek);
+    const r = await fetch('/search?' + params.toString());
     const data = await r.json();
     if (!r.ok) { status.textContent = 'エラー: ' + (data.detail || r.status); return; }
     status.textContent = `${data.count}件見つかりました`;
     if (data.count === 0) { result.innerHTML = '<p>該当なし</p>'; return; }
     let html = '<table><tr><th>動画ファイル</th><th>開始</th><th>終了</th><th>タイトル</th><th>要約</th></tr>';
     for (const row of data.results) {
-      const fname = row.object_key.split('/').pop();
+      const fname = row.filename;
       html += `<tr>
         <td class="filename">${fname}</td>
         <td>${row.start_sec}</td>

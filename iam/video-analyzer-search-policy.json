@@ -1,0 +1,74 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunAthenaQueries",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:StopQueryExecution"
+      ],
+      "Resource": "arn:aws:athena:ap-northeast-1:656445866169:workgroup/primary"
+    },
+    {
+      "Sid": "ReadVideoAnalyzerCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:GetPartitions"
+      ],
+      "Resource": [
+        "arn:aws:glue:ap-northeast-1:656445866169:catalog",
+        "arn:aws:glue:ap-northeast-1:656445866169:database/video_analyzer",
+        "arn:aws:glue:ap-northeast-1:656445866169:table/video_analyzer/*"
+      ]
+    },
+    {
+      "Sid": "ReadBucketLocation",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::bangumi-info"
+    },
+    {
+      "Sid": "ListAnalysisAndQueryResults",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::bangumi-info",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "",
+            "results",
+            "results/*",
+            "athena-data",
+            "athena-data/*",
+            "athena-results",
+            "athena-results/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadAnalysisCsv",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::bangumi-info/results/*",
+        "arn:aws:s3:::bangumi-info/athena-data/*"
+      ]
+    },
+    {
+      "Sid": "ManageAthenaQueryResults",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::bangumi-info/athena-results/*"
+    }
+  ]
+}

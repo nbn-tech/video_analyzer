@@ -57,16 +57,19 @@ class Settings(BaseSettings):
 
     # AWS
     aws_region: str = "ap-northeast-1"
+    aws_profile: str = ""
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     s3_bucket: str = ""
     s3_input_prefix: str = "movie/ch1/"
     s3_output_prefix: str = "results/"
+    s3_report_prefix: str = "reports/"
     s3_output_station: str = "nbn"
     sqs_queue_url: str = ""
     athena_output_location: str = ""
-    athena_glue_db: str = "bangumi_annotations"
-    athena_glue_table: str = "annotation"
+    athena_glue_db: str = "video_analyzer"
+    athena_glue_table: str = "daily_corners"
+    athena_aws_profile: str = ""
 
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.local"),

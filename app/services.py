@@ -46,7 +46,8 @@ Return only JSON array:
     "end_sec": 123.4,
     "title": "Corner title in Japanese",
     "summary": "Corner summary in natural Japanese",
-    "tags": ["タグ1", "タグ2", "タグ3"]
+    "tags": ["タグ1", "タグ2", "タグ3"],
+    "segment": "news"
   }
 ]
 
@@ -54,6 +55,12 @@ tags rules:
 - 3 to 6 tags per corner in Japanese
 - Include: topic category (e.g. スポーツ, 天気, 社会, 芸能), location, key person names, organization names, and keywords useful for search
 - Short and specific (1-4 characters each preferred)
+
+segment rules:
+- Choose exactly one value from: news, weather, sports, feature, ent, live, opening, ending, cm, sponsor, other
+- news: ニュース・報道 / weather: 天気予報 / sports: スポーツ / feature: 特集・企画
+- ent: エンタメ全般 / live: 中継 / opening: 番組オープニング / ending: 番組エンディング
+- cm: CM・広告 / sponsor: 提供クレジット / other: 上記以外
 """.strip()
 
 import threading
@@ -986,6 +993,7 @@ def _normalize_corners(corners: list[dict], rows: list[dict]) -> list[dict]:
                     "title": str(c.get("title", "Corner")).strip() or "Corner",
                     "summary": str(c.get("summary", "")).strip() or "No summary",
                     "tags": [str(t) for t in c.get("tags", []) if t],
+                    "segment": str(c.get("segment", "other")).strip() or "other",
                 }
             )
         except (TypeError, ValueError, KeyError):
@@ -1047,7 +1055,8 @@ Return only JSON array:
     "end_sec": 123.4,
     "title": "Corner title in Japanese",
     "summary": "Corner summary in natural Japanese",
-    "tags": ["タグ1", "タグ2", "タグ3"]
+    "tags": ["タグ1", "タグ2", "タグ3"],
+    "segment": "news"
   }
 ]
 
@@ -1055,6 +1064,12 @@ tags rules:
 - 3 to 6 tags per corner in Japanese
 - Include: topic category (e.g. スポーツ, 天気, 社会, 芸能), location, key person names, organization names, and keywords useful for search
 - Short and specific (1-4 characters each preferred)
+
+segment rules:
+- Choose exactly one value from: news, weather, sports, feature, ent, live, opening, ending, cm, sponsor, other
+- news: ニュース・報道 / weather: 天気予報 / sports: スポーツ / feature: 特集・企画
+- ent: エンタメ全般 / live: 中継 / opening: 番組オープニング / ending: 番組エンディング
+- cm: CM・広告 / sponsor: 提供クレジット / other: 上記以外
 """.strip()
 
 

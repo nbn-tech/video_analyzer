@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import logging
+import subprocess
 import tempfile
 import time
 from urllib.parse import unquote_plus
@@ -47,12 +48,18 @@ log = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".m2ts", ".mts"}
 
 
-def _build_boto_kwargs() -> dict:
+def _build_boto_session() -> boto3.Session:
+    if settings.aws_profile:
+        return boto3.Session(
+            profile_name=settings.aws_profile,
+            region_name=settings.aws_region,
+        )
+
     kwargs: dict = {"region_name": settings.aws_region}
     if settings.aws_access_key_id:
         kwargs["aws_access_key_id"] = settings.aws_access_key_id
         kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-    return kwargs
+    return boto3.Session(**kwargs)
 
 
 def _calc_cost(usage: dict | None) -> dict:
@@ -78,42 +85,86 @@ def _calc_cost(usage: dict | None) -> dict:
     }
 
 
-def _corners_to_csv(filename: str, corners: list[dict], cost: dict) -> str:
+def _corners_to_csv(s3_key: str, corners: list[dict]) -> str:
+    parts = s3_key.split("/")
+    channel = parts[1] if len(parts) >= 4 else ""
+    broadcast_date = parts[2] if len(parts) >= 4 else ""
+    filename = Path(s3_key).name
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["filename", "start_sec", "end_sec", "title", "summary", "tags"])
+    writer.writerow(["broadcast_date", "channel", "filename", "start_sec", "end_sec", "title", "summary", "tags", "segment"])
     for c in corners:
         tags = c.get("tags", [])
         tags_str = "|".join(tags) if isinstance(tags, list) else str(tags)
         writer.writerow([
+            broadcast_date,
+            channel,
             filename,
             f"{c['start_sec']:.3f}",
             f"{c['end_sec']:.3f}",
             c.get("title", ""),
             c.get("summary", ""),
             tags_str,
+            c.get("segment", "other"),
         ])
-    writer.writerow([])
-    writer.writerow(["# Gemini使用トークン数"])
-    writer.writerow(["入力トークン", "出力トークン", "思考トークン", "合計トークン", "料金(USD)", "料金(円・概算)"])
-    writer.writerow([
-        cost["input_tokens"],
-        cost["output_tokens"],
-        cost["thinking_tokens"],
-        cost["total_tokens"],
-        f"${cost['cost_usd']:.6f}",
-        f"約{cost['cost_jpy']:.2f}円 (1USD={settings.usd_to_jpy}円換算)",
-    ])
     return buf.getvalue()
 
 
-def _build_output_key(s3_key: str, suffix: str = "_corners.csv") -> str:
+def _build_output_key(s3_key: str, suffix: str, prefix: str | None = None) -> str:
     parts = s3_key.split("/")
-    date_dir = parts[-2] if len(parts) >= 2 else "unknown"
+    channel = parts[1] if len(parts) >= 4 else "unknown"
+    date_dir = parts[2] if len(parts) >= 4 else (parts[-2] if len(parts) >= 2 else "unknown")
     stem = Path(s3_key).stem
-    base = settings.s3_output_prefix.rstrip("/")
-    station = settings.s3_output_station.strip("/")
-    return f"{base}/{station}/{date_dir}/{stem}{suffix}"
+    base = (prefix or settings.s3_output_prefix).rstrip("/")
+    return f"{base}/{channel}/{date_dir}/{stem}{suffix}"
+
+
+def _update_daily_parquet_with_retry(s3_key: str, csv_key: str) -> tuple[str, int]:
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            log.info("日次Parquet更新開始: attempt=%d/%d key=%s", attempt, attempts, s3_key)
+            cmd = [
+                sys.executable,
+                "-m",
+                "app.daily_parquet",
+                "--bucket",
+                settings.s3_bucket,
+                "--source-key",
+                s3_key,
+                "--csv-key",
+                csv_key,
+                "--region",
+                settings.aws_region,
+            ]
+            if settings.aws_profile:
+                cmd.extend(["--profile", settings.aws_profile])
+            completed = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            payload = json.loads(completed.stdout.strip().splitlines()[-1])
+            return str(payload["parquet_key"]), int(payload["row_count"])
+        except Exception:
+            if attempt == attempts:
+                log.exception("日次Parquet更新失敗: %d回試行 key=%s", attempts, s3_key)
+                raise
+            wait_seconds = attempt * 3
+            log.warning(
+                "日次Parquet更新を再試行します: attempt=%d/%d wait=%d秒 key=%s",
+                attempt,
+                attempts,
+                wait_seconds,
+                s3_key,
+                exc_info=True,
+            )
+            time.sleep(wait_seconds)
+
+    raise RuntimeError("unreachable")
 
 
 def _sec_to_hms(sec: float) -> str:
@@ -202,12 +253,9 @@ def _build_html_report(filename: str, corners: list[dict], audio_rows: list[dict
 </html>"""
 
 
-from app.athena import sync_glue_table
-
-
 def _process_s3_object(s3_key: str) -> None:
-    boto_kwargs = _build_boto_kwargs()
-    s3 = boto3.client("s3", **boto_kwargs)
+    session = _build_boto_session()
+    s3 = session.client("s3")
 
     ext = Path(s3_key).suffix.lower()
     if ext not in VIDEO_EXTENSIONS:
@@ -236,12 +284,16 @@ def _process_s3_object(s3_key: str) -> None:
         s3.put_object(
             Bucket=settings.s3_bucket,
             Key=csv_key,
-            Body=_corners_to_csv(filename, corners, cost).encode("utf-8-sig"),
+            Body=_corners_to_csv(s3_key, corners).encode("utf-8-sig"),
             ContentType="text/csv; charset=utf-8",
         )
         log.info("CSV出力完了: s3://%s/%s", settings.s3_bucket, csv_key)
 
-        html_key = _build_output_key(s3_key, "_report.html")
+        html_key = _build_output_key(
+            s3_key,
+            "_report.html",
+            prefix=settings.s3_report_prefix,
+        )
         s3.put_object(
             Bucket=settings.s3_bucket,
             Key=html_key,
@@ -250,27 +302,13 @@ def _process_s3_object(s3_key: str) -> None:
         )
         log.info("HTML出力完了: s3://%s/%s", settings.s3_bucket, html_key)
 
-        try:
-            for i, corner in enumerate(corners):
-                tags_str = "|".join(corner.get("tags", [])) if isinstance(corner.get("tags"), list) else str(corner.get("tags", ""))
-                buf = io.StringIO()
-                csv.writer(buf).writerow([
-                    f"{corner['start_sec']:.3f}",
-                    f"{corner['end_sec']:.3f}",
-                    corner.get("title", ""),
-                    corner.get("summary", ""),
-                    tags_str,
-                ])
-                s3.put_object_annotation(
-                    Bucket=settings.s3_bucket,
-                    Key=s3_key,
-                    AnnotationName=f"corner_{i:04d}",
-                    AnnotationPayload=buf.getvalue().strip().encode("utf-8"),
-                )
-            log.info("アノテーション付与完了: %d件 s3://%s/%s", len(corners), settings.s3_bucket, s3_key)
-            sync_glue_table()
-        except Exception as e:
-            log.warning("アノテーション付与失敗（boto3未対応の可能性）: %s", e)
+        parquet_key, daily_row_count = _update_daily_parquet_with_retry(s3_key, csv_key)
+        log.info(
+            "日次Parquet更新完了: %d件 s3://%s/%s",
+            daily_row_count,
+            settings.s3_bucket,
+            parquet_key,
+        )
 
 
 def _parse_s3_records(body: str) -> list[str]:
@@ -306,8 +344,8 @@ def run_worker() -> None:
         log.error("S3_BUCKET が設定されていません。.env.local を確認してください。")
         sys.exit(1)
 
-    boto_kwargs = _build_boto_kwargs()
-    sqs = boto3.client("sqs", **boto_kwargs)
+    session = _build_boto_session()
+    sqs = session.client("sqs")
 
     log.info("ワーカー起動。SQSポーリング中: %s", settings.sqs_queue_url)
 
