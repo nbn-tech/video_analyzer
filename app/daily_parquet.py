@@ -23,6 +23,7 @@ _SCHEMA = pa.schema(
         ("title", pa.string()),
         ("summary", pa.string()),
         ("tags", pa.string()),
+        ("segment", pa.string()),
     ]
 )
 
@@ -83,6 +84,7 @@ def update_daily_parquet(s3, bucket: str, s3_key: str, corners: list[dict]) -> t
                 "title": str(corner.get("title", "")),
                 "summary": str(corner.get("summary", "")),
                 "tags": "|".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags),
+                "segment": str(corner.get("segment", "")) or None,
             }
         )
 
@@ -116,6 +118,7 @@ def update_daily_parquet_from_csv(
             "title": row["title"],
             "summary": row["summary"],
             "tags": row["tags"].split("|") if row["tags"] else [],
+            "segment": row.get("segment") or None,
         }
         for row in rows
     ]
