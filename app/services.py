@@ -356,7 +356,6 @@ def _segment_rows(transcript: dict) -> list[dict]:
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
         no_speech_prob = seg.get("no_speech_prob")
-        logger.info("[no_speech_prob] %.1f-%.1f  prob=%.3f", start, end, no_speech_prob if no_speech_prob is not None else -1)
         if end <= start:
             continue
         text = _apply_custom_vocabulary((seg.get("text") or "").strip())
