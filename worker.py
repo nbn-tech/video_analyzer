@@ -22,11 +22,13 @@ import io
 import json
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 from datetime import datetime
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote_plus
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
@@ -113,8 +115,33 @@ def _video_priority_key(s3_key: str, windows: list[tuple[int, int]]) -> tuple:
     return (date, window_idx, channel_idx, start_sec if start_sec is not None else 0, s3_key)
 
 
+def _video_source_url(s3, s3_key: str) -> str:
+    """ffprobe/ffmpegで直接読む動画URL。VIDEO_CDN_BASEがあればCloudFront、なければS3のpresigned URL。"""
+    if settings.video_cdn_base:
+        return f"{settings.video_cdn_base.rstrip('/')}/{quote(s3_key)}"
+    return s3.generate_presigned_url(
+        "get_object", Params={"Bucket": settings.s3_bucket, "Key": s3_key}, ExpiresIn=300
+    )
+
+
+def _download_video(s3, s3_key: str, dest: Path) -> None:
+    """動画をローカルにダウンロードする。CloudFront経由で失敗した場合のみS3から直接取り直す。"""
+    if settings.video_cdn_base:
+        url = _video_source_url(s3, s3_key)
+        try:
+            with urllib.request.urlopen(url, timeout=60) as res, open(dest, "wb") as f:
+                expected = res.headers.get("Content-Length")
+                shutil.copyfileobj(res, f, length=8 * 1024 * 1024)
+            if expected is not None and dest.stat().st_size != int(expected):
+                raise IOError(f"サイズ不一致: {dest.stat().st_size} != {expected}")
+            return
+        except Exception:
+            log.exception("CloudFront経由のダウンロードに失敗、S3から直接取得します: %s", url)
+    s3.download_file(settings.s3_bucket, s3_key, str(dest))
+
+
 def _probe_duration_sec_url(url: str) -> float:
-    """URL（presigned URL、またはローカルファイルパス）に対してffprobeを実行する。"""
+    """URL（CloudFront/presigned URL、またはローカルファイルパス）に対してffprobeを実行する。"""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", url],
@@ -177,34 +204,16 @@ def _is_all_black_video(url: str, duration_sec: float) -> bool:
     return all(results)
 
 
-def _video_matches_time_windows(
-    s3, bucket: str, s3_key: str, windows: list[tuple[int, int]]
-) -> bool:
-    """番組の放送時間帯（ファイル名の開始時刻＋実尺）が指定ウィンドウに重なるか判定する。
-
-    ダウンロード前にpresigned URL越しにffprobeで実尺を確認する（全体ダウンロード不要）。
-    """
-    start_sec = _filename_start_sec(s3_key)
-    if start_sec is None:
-        return True  # ファイル名から時刻が読めない場合は対象外にせず処理する
-
-    window_end_max = max(w[1] for w in windows)
-    window_start_min = min(w[0] for w in windows)
-    if start_sec >= window_end_max or start_sec < window_start_min - _MAX_PROBE_LOOKBACK_SEC:
-        return False
-
-    url = s3.generate_presigned_url(
-        "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=300
+def _may_overlap_time_windows(start_sec: int, windows: list[tuple[int, int]]) -> bool:
+    """実尺を知らなくても(番組尺の上限想定で)いずれかのウィンドウに重なり得るか。ファイル名だけで判定できる。"""
+    return any(
+        start_sec < w_end and start_sec + _MAX_PROBE_LOOKBACK_SEC > w_start for w_start, w_end in windows
     )
-    try:
-        duration = _probe_duration_sec_url(url)
-    except Exception:
-        log.exception("尺の事前確認に失敗しました。時間帯フィルタでは対象外扱いにします: %s", s3_key)
-        return False
-    if duration <= 0:
-        log.warning("尺取得できず(0秒)、時間帯フィルタでは対象外扱いにします: %s", s3_key)
-        return False
-    end_sec = start_sec + duration
+
+
+def _overlaps_time_windows(start_sec: int, duration_sec: float, windows: list[tuple[int, int]]) -> bool:
+    """番組の放送時間帯（ファイル名の開始時刻＋実尺）が指定ウィンドウに重なるか。"""
+    end_sec = start_sec + duration_sec
     return any(start_sec < w_end and end_sec > w_start for w_start, w_end in windows)
 
 
@@ -422,10 +431,16 @@ def _process_s3_object(s3_key: str) -> None:
         log.info("スキップ（動画以外）: %s", s3_key)
         return
 
-    if settings.max_video_duration_sec:
-        url = s3.generate_presigned_url(
-            "get_object", Params={"Bucket": settings.s3_bucket, "Key": s3_key}, ExpiresIn=300
-        )
+    # 事前チェックは動画の読み取り量が少ない順に行う(時間帯外の動画にまで黒判定のフレーム取得をしないため):
+    # ファイル名だけで時間帯判定 → ffprobeで尺を1回だけ取得 → 尺上限・時間帯判定 → 黒判定(フレームを最大6回読む)
+    windows = _parse_time_windows(settings.process_time_windows) if settings.process_time_windows else None
+    start_sec = _filename_start_sec(s3_key)  # 読めない場合は時間帯フィルタの対象外にせず処理する
+    if windows and start_sec is not None and not _may_overlap_time_windows(start_sec, windows):
+        log.info("スキップ（時間帯フィルタ対象外）: %s", s3_key)
+        return
+
+    if settings.max_video_duration_sec or windows:
+        url = _video_source_url(s3, s3_key)
         try:
             duration = _probe_duration_sec_url(url)
         except Exception:
@@ -434,20 +449,17 @@ def _process_s3_object(s3_key: str) -> None:
         if duration <= 0:
             log.warning("尺取得できず(0秒)、安全のためスキップします: %s", s3_key)
             return
-        if duration > float(settings.max_video_duration_sec):
+        if settings.max_video_duration_sec and duration > float(settings.max_video_duration_sec):
             log.info(
                 "スキップ（録画ミス扱い: %.0f秒 > 上限%.0f秒）: %s",
                 duration, settings.max_video_duration_sec, s3_key,
             )
             return
-        if _is_all_black_video(url, duration):
-            log.info("スキップ（全フレーム黒判定、録画異常扱い）: %s", s3_key)
-            return
-
-    if settings.process_time_windows:
-        windows = _parse_time_windows(settings.process_time_windows)
-        if not _video_matches_time_windows(s3, settings.s3_bucket, s3_key, windows):
+        if windows and start_sec is not None and not _overlaps_time_windows(start_sec, duration, windows):
             log.info("スキップ（時間帯フィルタ対象外）: %s", s3_key)
+            return
+        if settings.max_video_duration_sec and _is_all_black_video(url, duration):
+            log.info("スキップ（全フレーム黒判定、録画異常扱い）: %s", s3_key)
             return
 
     log.info("処理開始: s3://%s/%s", settings.s3_bucket, s3_key)
@@ -455,7 +467,7 @@ def _process_s3_object(s3_key: str) -> None:
     with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmpdir:
         local_video = Path(tmpdir) / Path(s3_key).name
         log.info("ダウンロード中...")
-        s3.download_file(settings.s3_bucket, s3_key, str(local_video))
+        _download_video(s3, s3_key, local_video)
         log.info("ダウンロード完了: %s", local_video)
 
         analyzed = segment_corners(local_video)

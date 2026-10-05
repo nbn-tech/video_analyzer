@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     s3_input_prefix: str = "movie/ch1/"
     s3_output_prefix: str = "results/"
     s3_report_prefix: str = "reports/"
+    # 動画(movie/)の取得元。設定するとS3直接(presigned URL / download_file)ではなくCloudFront経由で
+    # 取得する(S3→インターネットの転送料削減のため。CloudFrontは月1TBまで無料)。空ならS3から直接取得
+    video_cdn_base: str = "https://d1hgr51u5pbk6o.cloudfront.net"
     s3_output_station: str = "nbn"
     sqs_queue_url: str = ""
     athena_output_location: str = ""

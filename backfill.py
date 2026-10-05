@@ -25,11 +25,13 @@ from worker import (
     VIDEO_EXTENSIONS,
     _build_boto_session,
     _filename_start_sec,
-    _MAX_PROBE_LOOKBACK_SEC,
+    _may_overlap_time_windows,
+    _overlaps_time_windows,
     _parse_time_windows,
     _probe_duration_sec_url,
     _process_s3_object,
     _video_priority_key,
+    _video_source_url,
     drain_sqs_batch,
     log,
     run_worker,
@@ -49,16 +51,13 @@ def _filter_by_time_windows(
     s3, bucket: str, videos: list[str], windows: list[tuple[int, int]]
 ) -> list[str]:
     """番組の放送時間帯（ファイル名の開始時刻＋実尺）が指定ウィンドウに重なる動画だけ残す。"""
-    window_start_min = min(w[0] for w in windows)
-    window_end_max = max(w[1] for w in windows)
-
     candidates = []
     for key in videos:
         start_sec = _filename_start_sec(key)
         if start_sec is None:
             continue
         # 実尺を知らなくても明らかに重なりようがないものは事前に除外する
-        if start_sec >= window_end_max or start_sec < window_start_min - _MAX_PROBE_LOOKBACK_SEC:
+        if not _may_overlap_time_windows(start_sec, windows):
             continue
         candidates.append((key, start_sec))
 
@@ -67,9 +66,7 @@ def _filter_by_time_windows(
     kept = []
     for i, (key, start_sec) in enumerate(candidates, 1):
         try:
-            url = s3.generate_presigned_url(
-                "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
-            )
+            url = _video_source_url(s3, key)
             duration = _probe_duration_sec_url(url)
         except Exception:
             log.exception("尺取得に失敗、対象から除外します: %s", key)
@@ -77,9 +74,7 @@ def _filter_by_time_windows(
         if duration <= 0:
             log.warning("尺取得できず(0秒)、対象から除外します: %s", key)
             continue
-        end_sec = start_sec + duration
-        overlaps = any(start_sec < w_end and end_sec > w_start for w_start, w_end in windows)
-        if overlaps:
+        if _overlaps_time_windows(start_sec, duration, windows):
             kept.append(key)
         if i % 20 == 0 or i == len(candidates):
             log.info("時間帯フィルタ: 実尺確認 %d/%d本 完了（一致 %d本）", i, len(candidates), len(kept))
