@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     ocr_region_match_text_sim: float = 0.82
     ocr_region_match_x_px: int = 120
     ocr_region_match_y_px: int = 80
+
+    # Gemini入力用: 同一テロップがこの秒数以内に再検出されたら1行にまとめる（入力トークン削減）
+    ocr_gemini_dedup_gap_sec: float = 60.0
+    # Gemini入力用の同一判定は多少ゆるめる（OCRノイズによる句読点等の揺れを吸収するため）
+    ocr_gemini_dedup_text_sim: float = 0.7
     ocr_use_gpu: str = "auto"
     gemini_payload_dump: bool = True
     gemini_payload_dump_dir: str = "app/data/debug_payloads"
@@ -45,6 +50,18 @@ class Settings(BaseSettings):
     vision_max_frames: int = 50
 
     paddle_pdx_home: str = ""
+
+    # この秒数を超える動画は録画ミス扱いとして分析対象から除外する（空文字なら無効）
+    max_video_duration_sec: float = 14400.0  # 4時間
+
+    # 動画がこの秒数を超えたら、Geminiへの分類リクエストをチャンク分割する
+    gemini_chunk_threshold_sec: float = 5400.0  # 90分
+    # チャンク1つあたりの長さ
+    gemini_chunk_sec: float = 3600.0  # 60分
+
+    # 番組の放送時間帯がこのレンジにかぶる動画だけを処理対象にする。
+    # 例: "05:30-08:30,15:30-19:00"（空なら全時間帯を対象にする）
+    process_time_windows: str = ""
 
     # Gemini料金設定（変動するので必要に応じて.env.localで上書き）
     # gemini-2.5-flash 公式レート (USD/1Mトークン)

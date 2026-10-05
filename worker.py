@@ -21,9 +21,11 @@ import csv
 import io
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from urllib.parse import unquote_plus
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -38,14 +40,172 @@ if settings.paddle_pdx_home:
 
 from app.services import segment_corners
 
+_LOG_DIR = Path("logs")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / f"worker_{datetime.now().strftime('%Y%m%d')}.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+    ],
 )
 log = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".m2ts", ".mts"}
+
+_START_TIME_RE = re.compile(r"_(\d{8})_(\d{6})(?:\D|$)")
+_MAX_PROBE_LOOKBACK_SEC = 3 * 3600  # 番組尺の上限想定（事前絞り込み用）
+
+
+def _parse_time_windows(spec: str) -> list[tuple[int, int]]:
+    """'05:30-08:30,15:30-19:00' のような文字列を秒範囲のリストにする。"""
+    windows = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        start_str, end_str = part.split("-")
+        sh, sm = (int(x) for x in start_str.strip().split(":"))
+        eh, em = (int(x) for x in end_str.strip().split(":"))
+        start_sec = sh * 3600 + sm * 60
+        end_sec = eh * 3600 + em * 60
+        if end_sec <= start_sec:
+            raise ValueError(f"不正な時間帯指定です（終了が開始以前）: {part}")
+        windows.append((start_sec, end_sec))
+    return windows
+
+
+def _filename_start_sec(s3_key: str) -> int | None:
+    match = _START_TIME_RE.search(Path(s3_key).name)
+    if not match:
+        return None
+    hhmmss = match.group(2)
+    h, m, s = int(hhmmss[0:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+    return h * 3600 + m * 60 + s
+
+
+# 処理したい優先順: 日付 → 時間帯(PROCESS_TIME_WINDOWSに書いた順=午前/午後) → チャンネル
+_CHANNEL_PRIORITY = ["ch1", "ch4", "ch6", "ch2", "ch3", "ch10", "ch5"]
+
+
+def _video_priority_key(s3_key: str, windows: list[tuple[int, int]]) -> tuple:
+    """日付→時間帯(午前/午後)→チャンネル→時刻の順で並べ替えるためのソートキー。"""
+    parts = s3_key.split("/")
+    channel = parts[1] if len(parts) >= 2 else ""
+    date = parts[2] if len(parts) >= 3 else ""
+
+    start_sec = _filename_start_sec(s3_key)
+    window_idx = len(windows)  # どの時間帯にも一致しない場合は最後に回す
+    if start_sec is not None:
+        for i, (w_start, w_end) in enumerate(windows):
+            if w_start <= start_sec < w_end:
+                window_idx = i
+                break
+
+    if channel in _CHANNEL_PRIORITY:
+        channel_idx = _CHANNEL_PRIORITY.index(channel)
+    else:
+        channel_idx = len(_CHANNEL_PRIORITY)
+
+    return (date, window_idx, channel_idx, start_sec if start_sec is not None else 0, s3_key)
+
+
+def _probe_duration_sec_url(url: str) -> float:
+    """URL（presigned URL、またはローカルファイルパス）に対してffprobeを実行する。"""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", url],
+        capture_output=True, text=True, timeout=60,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+_BLACK_FRAME_BRIGHTNESS_THRESHOLD = 8.0  # 0-255スケール。これ未満なら「ほぼ真っ黒」とみなす
+_BLACK_FRAME_SAMPLE_FRACTIONS = (0.05, 0.2, 0.4, 0.6, 0.8, 0.95)
+
+
+def _sample_frame_is_black(url: str, time_sec: float) -> bool | None:
+    """指定タイムスタンプのフレームを1枚取得し、ほぼ真っ黒か判定する。取得失敗時はNoneを返す。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-ss", str(max(0.0, time_sec)), "-i", url,
+                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-",
+            ],
+            capture_output=True, timeout=60,
+        )
+    except Exception:
+        return None
+    if not result.stdout:
+        return None
+    try:
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(result.stdout)).convert("L")
+        mean_brightness = float(np.asarray(img).mean())
+    except Exception:
+        return None
+    return mean_brightness < _BLACK_FRAME_BRIGHTNESS_THRESHOLD
+
+
+def _is_all_black_video(url: str, duration_sec: float) -> bool:
+    """動画の複数箇所をサンプリングし、全て真っ黒なら録画異常とみなす。
+
+    サンプルが十分に取得できなかった場合は誤判定を避けるため False（対象外にしない）を返す。
+    """
+    if duration_sec <= 0:
+        return False
+
+    results: list[bool] = []
+    for frac in _BLACK_FRAME_SAMPLE_FRACTIONS:
+        is_black = _sample_frame_is_black(url, duration_sec * frac)
+        if is_black is None:
+            continue
+        results.append(is_black)
+
+    if len(results) < max(2, len(_BLACK_FRAME_SAMPLE_FRACTIONS) // 2):
+        return False
+    return all(results)
+
+
+def _video_matches_time_windows(
+    s3, bucket: str, s3_key: str, windows: list[tuple[int, int]]
+) -> bool:
+    """番組の放送時間帯（ファイル名の開始時刻＋実尺）が指定ウィンドウに重なるか判定する。
+
+    ダウンロード前にpresigned URL越しにffprobeで実尺を確認する（全体ダウンロード不要）。
+    """
+    start_sec = _filename_start_sec(s3_key)
+    if start_sec is None:
+        return True  # ファイル名から時刻が読めない場合は対象外にせず処理する
+
+    window_end_max = max(w[1] for w in windows)
+    window_start_min = min(w[0] for w in windows)
+    if start_sec >= window_end_max or start_sec < window_start_min - _MAX_PROBE_LOOKBACK_SEC:
+        return False
+
+    url = s3.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=300
+    )
+    try:
+        duration = _probe_duration_sec_url(url)
+    except Exception:
+        log.exception("尺の事前確認に失敗しました。時間帯フィルタでは対象外扱いにします: %s", s3_key)
+        return False
+    if duration <= 0:
+        log.warning("尺取得できず(0秒)、時間帯フィルタでは対象外扱いにします: %s", s3_key)
+        return False
+    end_sec = start_sec + duration
+    return any(start_sec < w_end and end_sec > w_start for w_start, w_end in windows)
 
 
 def _build_boto_session() -> boto3.Session:
@@ -262,6 +422,34 @@ def _process_s3_object(s3_key: str) -> None:
         log.info("スキップ（動画以外）: %s", s3_key)
         return
 
+    if settings.max_video_duration_sec:
+        url = s3.generate_presigned_url(
+            "get_object", Params={"Bucket": settings.s3_bucket, "Key": s3_key}, ExpiresIn=300
+        )
+        try:
+            duration = _probe_duration_sec_url(url)
+        except Exception:
+            log.exception("尺の事前確認に失敗しました。安全のためスキップします: %s", s3_key)
+            return
+        if duration <= 0:
+            log.warning("尺取得できず(0秒)、安全のためスキップします: %s", s3_key)
+            return
+        if duration > float(settings.max_video_duration_sec):
+            log.info(
+                "スキップ（録画ミス扱い: %.0f秒 > 上限%.0f秒）: %s",
+                duration, settings.max_video_duration_sec, s3_key,
+            )
+            return
+        if _is_all_black_video(url, duration):
+            log.info("スキップ（全フレーム黒判定、録画異常扱い）: %s", s3_key)
+            return
+
+    if settings.process_time_windows:
+        windows = _parse_time_windows(settings.process_time_windows)
+        if not _video_matches_time_windows(s3, settings.s3_bucket, s3_key, windows):
+            log.info("スキップ（時間帯フィルタ対象外）: %s", s3_key)
+            return
+
     log.info("処理開始: s3://%s/%s", settings.s3_bucket, s3_key)
 
     with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmpdir:
@@ -336,6 +524,61 @@ def _parse_s3_records(body: str) -> list[str]:
     return keys
 
 
+def drain_sqs_batch(sqs, windows: list[tuple[int, int]] | None, wait_time_sec: int) -> int:
+    """SQSから最大10件受信し、日付→時間帯→チャンネルの優先順で並べ替えてから処理する。
+
+    処理（削除）できた件数を返す。0件なら何も無かったということ。
+    worker.py本体（長いロングポーリング）と、backfill.py側の合間チェック（短い待ち時間）の
+    両方から共通で呼び出される。
+    """
+    try:
+        resp = sqs.receive_message(
+            QueueUrl=settings.sqs_queue_url,
+            MaxNumberOfMessages=10,  # まとめて受信し、優先順に並べ替えてから処理する
+            WaitTimeSeconds=wait_time_sec,
+            VisibilityTimeout=21600,  # 6時間（バッチ内の他動画の処理待ちを考慮した長め設定）
+        )
+    except Exception as exc:
+        log.error("SQS受信エラー: %s", exc)
+        return 0
+
+    messages = resp.get("Messages", [])
+    if not messages:
+        return 0
+
+    # メッセージごとにS3キーを展開し、日付→時間帯(午前/午後)→チャンネルの優先順で並べ替える
+    entries: list[tuple[tuple, dict, list[str]]] = []
+    for msg in messages:
+        s3_keys = _parse_s3_records(msg["Body"])
+        if s3_keys:
+            if windows:
+                priority = min(_video_priority_key(k, windows) for k in s3_keys)
+            else:
+                priority = (min(s3_keys),)
+        else:
+            priority = ("",)
+        entries.append((priority, msg, s3_keys))
+    entries.sort(key=lambda e: e[0])
+
+    processed = 0
+    for _priority, msg, s3_keys in entries:
+        receipt = msg["ReceiptHandle"]
+        try:
+            if not s3_keys:
+                log.info("S3レコードなし（テストメッセージ等）、スキップ")
+            else:
+                for key in s3_keys:
+                    _process_s3_object(key)
+
+            sqs.delete_message(QueueUrl=settings.sqs_queue_url, ReceiptHandle=receipt)
+            processed += 1
+
+        except Exception as exc:
+            log.exception("処理エラー（メッセージはキューに残します）: %s", exc)
+
+    return processed
+
+
 def run_worker() -> None:
     if not settings.sqs_queue_url:
         log.error("SQS_QUEUE_URL が設定されていません。.env.local を確認してください。")
@@ -347,40 +590,12 @@ def run_worker() -> None:
     session = _build_boto_session()
     sqs = session.client("sqs")
 
+    windows = _parse_time_windows(settings.process_time_windows) if settings.process_time_windows else None
+
     log.info("ワーカー起動。SQSポーリング中: %s", settings.sqs_queue_url)
 
     while True:
-        try:
-            resp = sqs.receive_message(
-                QueueUrl=settings.sqs_queue_url,
-                MaxNumberOfMessages=1,
-                WaitTimeSeconds=20,  # ロングポーリング（コスト削減）
-                VisibilityTimeout=3600,  # 1時間（長い動画対応）
-            )
-        except Exception as exc:
-            log.error("SQS受信エラー: %s", exc)
-            time.sleep(30)
-            continue
-
-        messages = resp.get("Messages", [])
-        if not messages:
-            continue
-
-        msg = messages[0]
-        receipt = msg["ReceiptHandle"]
-
-        try:
-            s3_keys = _parse_s3_records(msg["Body"])
-            if not s3_keys:
-                log.info("S3レコードなし（テストメッセージ等）、スキップ")
-            else:
-                for key in s3_keys:
-                    _process_s3_object(key)
-
-            sqs.delete_message(QueueUrl=settings.sqs_queue_url, ReceiptHandle=receipt)
-
-        except Exception as exc:
-            log.exception("処理エラー（メッセージはキューに残します）: %s", exc)
+        drain_sqs_batch(sqs, windows, wait_time_sec=20)  # ロングポーリング（コスト削減）
 
 
 if __name__ == "__main__":

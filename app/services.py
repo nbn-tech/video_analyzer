@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import google.generativeai as genai
 import whisper
+from google import genai as genai2
+from google.genai import types as genai2_types
 from PIL import Image
 from tqdm import tqdm
 
@@ -32,7 +35,7 @@ Rules:
 - Separate unrelated topics into separate corners.
 - In news programs, each news story that covers a different subject or event MUST be a separate corner. Do NOT merge two different news stories into one corner even if they appear back to back. When the topic changes (different event, different person, different location), always start a new corner.
 - Studio commentary or reactions about the same news story should be merged into the same corner as that story, not split off.
-- CM and commercial breaks: merge ALL consecutive CM segments into a single corner. Set the title to "CM" and the summary to "CM中". Do not describe CM content.
+- CM and commercial breaks: a CM break must ALWAYS be its own separate corner object in the output array. Never append CM time or "CM中" text into the summary of a non-CM corner, and never let a non-CM corner's summary absorb a CM break. Merge ALL consecutive CM segments within one commercial break into a single "cm" corner (do not split one break into multiple corners), but keep it as its own corner even if short. Set the title to "CM", the summary to "CM中", tags to ["CM", "広告"], and segment to "cm". Do not describe CM content.
 - Keep boundaries near candidate timestamps when possible.
 - The corners must cover the ENTIRE video duration with NO gaps. Every second of the video must belong to exactly one corner. The end_sec of each corner must equal the start_sec of the next corner.
 - Use OCR rows to supplement named entities, rankings, scores, and on-screen labels not captured in audio.
@@ -117,6 +120,19 @@ def _dump_gemini_payload(payload: dict) -> Path | None:
     filename = f"gemini_payload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
     target = dump_dir / filename
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+
+def _dump_gemini_raw_response(raw: str) -> Path | None:
+    """JSONパース失敗時に、調査用にGeminiの生応答全文を保存する。"""
+    if not settings.gemini_payload_dump:
+        return None
+
+    dump_dir = Path(settings.gemini_payload_dump_dir)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"gemini_raw_failed_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.txt"
+    target = dump_dir / filename
+    target.write_text(raw, encoding="utf-8")
     return target
 
 
@@ -827,6 +843,36 @@ def _merge_region_rows(raw_rows: list[dict], interval: float) -> list[dict]:
     ]
 
 
+def _compact_ocr_rows_for_gemini(ocr_rows: list[dict]) -> list[dict]:
+    """同一テロップが間を置いて繰り返し検出されている行を1行にまとめ、Gemini入力量を削減する。
+
+    HTMLレポート等で使う元のocr_rowsはそのまま残し、Geminiに渡すコピーだけを圧縮する。
+    """
+    if not ocr_rows:
+        return []
+
+    gap_sec = float(settings.ocr_gemini_dedup_gap_sec)
+    sim_threshold = float(settings.ocr_gemini_dedup_text_sim)
+
+    rows = sorted(ocr_rows, key=lambda r: r["start_sec"])
+    compacted: list[dict] = []
+    for cur in rows:
+        matched = False
+        for prev in reversed(compacted):
+            if cur["start_sec"] - prev["end_sec"] > gap_sec:
+                break
+            if _text_similarity(prev["text"], cur["text"]) >= sim_threshold:
+                prev["end_sec"] = max(prev["end_sec"], cur["end_sec"])
+                if len(cur["text"]) > len(prev["text"]):
+                    prev["text"] = cur["text"]
+                matched = True
+                break
+        if not matched:
+            compacted.append(dict(cur))
+
+    return compacted
+
+
 def _fallback_rows_from_raw_regions(raw_rows: list[dict], interval: float) -> list[dict]:
     grouped: dict[tuple[float, float], list[str]] = {}
     for row in raw_rows:
@@ -1005,7 +1051,8 @@ def _normalize_corners(corners: list[dict], rows: list[dict]) -> list[dict]:
     merged: list[dict] = [cleaned[0]]
     for cur in cleaned[1:]:
         prev = merged[-1]
-        if cur["start_sec"] - prev["end_sec"] <= settings.merge_gap_sec:
+        is_cm_boundary = cur["segment"] == "cm" or prev["segment"] == "cm"
+        if not is_cm_boundary and cur["start_sec"] - prev["end_sec"] <= settings.merge_gap_sec:
             if prev["end_sec"] - prev["start_sec"] < settings.min_corner_sec:
                 prev["end_sec"] = max(prev["end_sec"], cur["end_sec"])
                 prev["summary"] = f"{prev['summary']} {cur['summary']}".strip()
@@ -1185,6 +1232,253 @@ def segment_corners_vision(transcript: dict, video_path: Path) -> dict:
     }
 
 
+_MAIN_GEMINI_CONFIG = genai2_types.GenerateContentConfig(
+    # thinking_budget=24576: gemini-2.5-flashで許容される思考予算の上限に固定する。
+    # 出力上限(65536)との差分（最低でも約40960トークン）をJSON本文用に必ず確保し、
+    # 長尺動画で思考に予算を使い切ってJSONが途中で切れる事態を防ぐ。
+    thinking_config=genai2_types.ThinkingConfig(thinking_budget=24576),
+    max_output_tokens=65536,
+)
+
+_BOUNDARY_MERGE_GEMINI_CONFIG = genai2_types.GenerateContentConfig(
+    thinking_config=genai2_types.ThinkingConfig(thinking_budget=1024),
+    max_output_tokens=4096,
+)
+
+_BOUNDARY_MERGE_PROMPT = """
+Two video corners were segmented independently, from two adjacent time chunks of the SAME
+continuous broadcast that were processed separately for technical reasons (the chunk boundary
+falls exactly between them).
+
+Decide whether Corner A and Corner B are actually the same single continuing topic that got
+artificially cut at the chunk boundary, or whether they are genuinely two different topics that
+simply happen to be adjacent.
+
+Rules:
+- Never merge if either corner's "segment" is "cm".
+- Only merge if they are clearly the same topic/story continuing (e.g. one news report or
+  weather forecast split mid-way by the chunk boundary).
+- When merging, write a single natural Japanese title and summary covering the full merged
+  range, combining tags from both sides (3 to 6 tags total).
+
+Return only JSON, no markdown fences.
+If they should be merged:
+{"merge": true, "title": "...", "summary": "...", "tags": ["..."], "segment": "..."}
+If they should stay separate:
+{"merge": false}
+""".strip()
+
+
+def _generate_json_with_retries(
+    client,
+    prompt: str,
+    config: "genai2_types.GenerateContentConfig",
+    max_attempts: int = 3,
+    context: str = "",
+) -> tuple[object | None, dict | None]:
+    """Gemini呼び出し+JSONパースを行い、失敗時は数回リトライする。
+
+    Geminiの生成には非決定性があり、ごく稀にJSON構文が崩れた状態でSTOPすることがあるため、
+    パース失敗時は即フォールバックせず数回リトライする。
+    戻り値は (parsed_json_or_None, gemini_usage_or_None)。
+    """
+    parsed = None
+    gemini_usage = None
+    last_raw = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception:
+            logger.exception(
+                "Gemini request failed (attempt %d/%d)%s", attempt, max_attempts, context,
+            )
+            continue
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            gemini_usage = {
+                "input_tokens": getattr(usage, "prompt_token_count", 0),
+                "output_tokens": getattr(usage, "candidates_token_count", 0),
+                "total_tokens": getattr(usage, "total_token_count", 0),
+            }
+            print(f"[gemini_usage]{context} attempt={attempt} {gemini_usage}")
+
+        raw = (response.text or "").strip()
+        last_raw = raw
+
+        try:
+            parsed = json.loads(raw)
+            break
+        except json.JSONDecodeError:
+            cleaned = raw.removeprefix("```json").removesuffix("```").strip()
+            try:
+                parsed = json.loads(cleaned)
+                break
+            except json.JSONDecodeError:
+                finish_reason = None
+                try:
+                    finish_reason = response.candidates[0].finish_reason
+                except Exception:
+                    pass
+                logger.warning(
+                    "Gemini JSON parse failed (attempt %d/%d)%s. finish_reason=%s raw_preview=%r",
+                    attempt, max_attempts, context, finish_reason, raw[:500],
+                )
+                parsed = None
+
+    if parsed is None:
+        dumped_raw = _dump_gemini_raw_response(last_raw)
+        logger.error(
+            "Gemini JSON parse failed after %d attempts%s. raw_dump=%s",
+            max_attempts, context, dumped_raw,
+        )
+
+    return parsed, gemini_usage
+
+
+def _chunk_fallback_corner(audio_rows_chunk: list[dict], chunk_start: float, chunk_end: float) -> list[dict]:
+    text = " ".join(str(r.get("text", "")) for r in audio_rows_chunk).strip()
+    return [
+        {
+            "start_sec": chunk_start,
+            "end_sec": chunk_end,
+            "title": "Overall",
+            "summary": text[:400] if text else "Transcription result could not be retrieved.",
+            "tags": [],
+            "segment": "other",
+        }
+    ]
+
+
+def _maybe_merge_boundary_corners(client, prev: dict, cur: dict) -> dict | None:
+    if prev.get("segment") == "cm" or cur.get("segment") == "cm":
+        return None
+
+    keys = ("start_sec", "end_sec", "title", "summary", "tags", "segment")
+    payload = {
+        "corner_a": {k: prev[k] for k in keys},
+        "corner_b": {k: cur[k] for k in keys},
+    }
+    prompt = f"{_BOUNDARY_MERGE_PROMPT}\n\nInput data (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
+    parsed, _usage = _generate_json_with_retries(
+        client, prompt, _BOUNDARY_MERGE_GEMINI_CONFIG, max_attempts=2, context=" boundary_merge",
+    )
+    if not isinstance(parsed, dict) or not parsed.get("merge"):
+        return None
+
+    return {
+        "start_sec": prev["start_sec"],
+        "end_sec": cur["end_sec"],
+        "title": str(parsed.get("title") or prev["title"]).strip() or prev["title"],
+        "summary": str(parsed.get("summary") or "").strip()
+        or f"{prev['summary']} {cur['summary']}".strip(),
+        "tags": [str(t) for t in parsed.get("tags", []) if t]
+        or list(dict.fromkeys(prev["tags"] + cur["tags"])),
+        "segment": str(parsed.get("segment") or prev["segment"]).strip() or prev["segment"],
+    }
+
+
+def _reconcile_chunk_boundaries(
+    client, corners: list[dict], boundary_positions: list[int]
+) -> list[dict]:
+    """チャンクの継ぎ目にあるコーナーのペアだけ、合体すべきかGeminiに判定させる。"""
+    if not boundary_positions:
+        return corners
+
+    result = list(corners)
+    shift = 0
+    for pos in boundary_positions:
+        idx = pos - shift
+        if idx <= 0 or idx >= len(result):
+            continue
+        prev, cur = result[idx - 1], result[idx]
+        merged = _maybe_merge_boundary_corners(client, prev, cur)
+        if merged is not None:
+            result[idx - 1 : idx + 1] = [merged]
+            shift += 1
+    return result
+
+
+def _segment_corners_chunked(
+    client,
+    audio_rows: list[dict],
+    ocr_rows: list[dict],
+    compact_ocr_rows: list[dict],
+) -> dict:
+    """長尺動画向け: 一定時間ごとにチャンク分割してGeminiに投げ、継ぎ目だけ後から合体判定する。"""
+    chunk_sec = float(settings.gemini_chunk_sec)
+    total_duration = audio_rows[-1]["end_sec"] if audio_rows else 0.0
+    num_chunks = max(1, math.ceil(total_duration / chunk_sec))
+    # 最後のチャンクが極端に短くなる場合（例: 2時間5秒を3600秒区切りにすると
+    # 最後が5秒だけになる）は、1つ前のチャンクに吸収させて断片チャンクを作らない。
+    if num_chunks > 1:
+        last_chunk_len = total_duration - (num_chunks - 1) * chunk_sec
+        if last_chunk_len < chunk_sec * 0.25:
+            num_chunks -= 1
+    print(
+        f"[segment_corners] long video ({total_duration:.0f}s) -> "
+        f"{num_chunks} chunk(s) of {chunk_sec:.0f}s"
+    )
+
+    all_corners: list[dict] = []
+    boundary_positions: list[int] = []
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    for i in range(num_chunks):
+        chunk_start = i * chunk_sec
+        chunk_end = total_duration if i == num_chunks - 1 else (i + 1) * chunk_sec
+        audio_chunk = [r for r in audio_rows if chunk_start <= r["start_sec"] < chunk_end]
+        ocr_chunk = [r for r in compact_ocr_rows if chunk_start <= r["start_sec"] < chunk_end]
+        if not audio_chunk:
+            continue
+
+        note = (
+            f"\n\nThis input covers only the {chunk_start:.0f}-{chunk_end:.0f} second range "
+            f"of a longer video (chunk {i + 1}/{num_chunks}). Corners must cover exactly this "
+            "range with no gaps, and must not reference content outside this range."
+        )
+        payload = {
+            "audio_rows": audio_chunk,
+            "ocr_rows": ocr_chunk,
+            "boundary_candidates_sec": _boundary_candidates(audio_chunk),
+        }
+        dumped = _dump_gemini_payload(payload)
+        if dumped:
+            print(f"[segment_corners] chunk={i + 1}/{num_chunks} payload_saved={dumped}")
+        prompt = f"{_PROMPT}{note}\n\nInput data (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
+
+        parsed, usage = _generate_json_with_retries(
+            client, prompt, _MAIN_GEMINI_CONFIG, context=f" chunk={i + 1}/{num_chunks}",
+        )
+        if usage:
+            for k in usage_totals:
+                usage_totals[k] += usage.get(k, 0)
+
+        if parsed is None:
+            corners_i = _chunk_fallback_corner(audio_chunk, chunk_start, chunk_end)
+        else:
+            corners_i = _normalize_corners(parsed, audio_chunk)
+            if not corners_i:
+                corners_i = _chunk_fallback_corner(audio_chunk, chunk_start, chunk_end)
+
+        if all_corners and corners_i:
+            boundary_positions.append(len(all_corners))
+        all_corners.extend(corners_i)
+
+    merged_corners = _reconcile_chunk_boundaries(client, all_corners, boundary_positions)
+
+    return {
+        "corners": merged_corners,
+        "audio_rows": audio_rows,
+        "ocr_rows": ocr_rows,
+        "gemini_usage": usage_totals,
+    }
+
+
 def segment_corners(video_path: Path) -> dict:
     """Whisper文字起こしとOCRを並列実行してからGeminiでコーナー分類する。"""
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1202,59 +1496,33 @@ def segment_corners(video_path: Path) -> dict:
             "ocr_rows": ocr_rows,
         }
 
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel(settings.gemini_model)
+    client = genai2.Client(api_key=settings.gemini_api_key)
+
+    compact_ocr_rows = _compact_ocr_rows_for_gemini(ocr_rows)
+    print(f"[segment_corners] ocr_rows_for_gemini={len(compact_ocr_rows)} (raw merged={len(ocr_rows)})")
+
+    total_duration = audio_rows[-1]["end_sec"] if audio_rows else 0.0
+    if total_duration > settings.gemini_chunk_threshold_sec:
+        return _segment_corners_chunked(client, audio_rows, ocr_rows, compact_ocr_rows)
 
     payload = {
         "audio_rows": audio_rows,
-        "ocr_rows": ocr_rows,
+        "ocr_rows": compact_ocr_rows,
         "boundary_candidates_sec": _boundary_candidates(audio_rows),
     }
     dumped = _dump_gemini_payload(payload)
     if dumped:
         print(f"[segment_corners] payload_saved={dumped}")
     prompt = f"{_PROMPT}\n\nInput data (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
-    try:
-        response = model.generate_content(prompt)
-    except Exception:
-        logger.exception(
-            "Gemini request failed: audio_rows=%d ocr_rows=%d",
-            len(audio_rows),
-            len(ocr_rows),
-        )
+
+    parsed, gemini_usage = _generate_json_with_retries(client, prompt, _MAIN_GEMINI_CONFIG)
+    if parsed is None:
         return {
             "corners": _fallback_segments(transcript),
             "audio_rows": audio_rows,
             "ocr_rows": ocr_rows,
-            "gemini_usage": None,
+            "gemini_usage": gemini_usage,
         }
-
-    usage = getattr(response, "usage_metadata", None)
-    gemini_usage = None
-    if usage is not None:
-        gemini_usage = {
-            "input_tokens": getattr(usage, "prompt_token_count", 0),
-            "output_tokens": getattr(usage, "candidates_token_count", 0),
-            "total_tokens": getattr(usage, "total_token_count", 0),
-        }
-        print(f"[gemini_usage] {gemini_usage}")
-
-    raw = (response.text or "").strip()
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        cleaned = raw.removeprefix("```json").removesuffix("```").strip()
-        try:
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError:
-            logger.error("Gemini JSON parse failed. raw_preview=%r", raw[:500])
-            return {
-                "corners": _fallback_segments(transcript),
-                "audio_rows": audio_rows,
-                "ocr_rows": ocr_rows,
-                "gemini_usage": gemini_usage,
-            }
 
     normalized = _normalize_corners(parsed, audio_rows)
     if not normalized:

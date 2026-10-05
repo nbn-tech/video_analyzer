@@ -36,3 +36,4 @@ video_analyzer.egg-info/
 paddleocr_models/
 paddlex_models/
 pip_cache/
+logs/
