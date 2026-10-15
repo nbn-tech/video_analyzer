@@ -1017,6 +1017,22 @@ def _fallback_segments(transcript: dict) -> list[dict]:
     ]
 
 
+_VALID_SEGMENTS = {
+    "news", "weather", "sports", "feature", "ent",
+    "live", "opening", "ending", "cm", "sponsor", "other",
+}
+
+
+def _coerce_segment(value: object, fallback: str = "other") -> str:
+    """Geminiの出力をプロンプト指定の11種に強制する。想定外の値（例: program_promo）はotherに落とす。"""
+    text = str(value or "").strip().lower()
+    if text in _VALID_SEGMENTS:
+        return text
+    if text:
+        logger.warning("未知のsegment値をotherに補正しました: %r", text)
+    return fallback if fallback in _VALID_SEGMENTS else "other"
+
+
 def _normalize_corners(corners: list[dict], rows: list[dict]) -> list[dict]:
     if not rows:
         return corners
@@ -1038,7 +1054,7 @@ def _normalize_corners(corners: list[dict], rows: list[dict]) -> list[dict]:
                     "title": str(c.get("title", "Corner")).strip() or "Corner",
                     "summary": str(c.get("summary", "")).strip() or "No summary",
                     "tags": [str(t) for t in c.get("tags", []) if t],
-                    "segment": str(c.get("segment", "other")).strip() or "other",
+                    "segment": _coerce_segment(c.get("segment")),
                 }
             )
         except (TypeError, ValueError, KeyError):
@@ -1378,7 +1394,7 @@ def _maybe_merge_boundary_corners(client, prev: dict, cur: dict) -> dict | None:
         or f"{prev['summary']} {cur['summary']}".strip(),
         "tags": [str(t) for t in parsed.get("tags", []) if t]
         or list(dict.fromkeys(prev["tags"] + cur["tags"])),
-        "segment": str(parsed.get("segment") or prev["segment"]).strip() or prev["segment"],
+        "segment": _coerce_segment(parsed.get("segment"), fallback=prev["segment"]),
     }
 
 
