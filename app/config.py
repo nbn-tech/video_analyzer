@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # 例: "05:30-08:30,15:30-19:00"（空なら全時間帯を対象にする）
     process_time_windows: str = ""
 
+    # 特定の曜日・特定の日付以降だけ追加で対象にする特例の時間帯。
+    # 形式: "<mon|tue|wed|thu|fri|sat|sun>|<HH:MM-HH:MM>|<YYYYMMDD以降>"（カンマ区切りで複数指定可）
+    # 例: "sat|10:45-11:45|20261001" → 2026/10/1以降の土曜日の10:45-11:45だけ追加で対象にする
+    process_time_windows_extra: str = ""
+
     # Gemini料金設定（変動するので必要に応じて.env.localで上書き）
     # gemini-2.5-flash 公式レート (USD/1Mトークン)
     gemini_input_price_usd_per_1m: float = 0.30

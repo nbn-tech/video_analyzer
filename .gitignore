@@ -37,3 +37,4 @@ paddleocr_models/
 paddlex_models/
 pip_cache/
 logs/
+hung_videos.txt

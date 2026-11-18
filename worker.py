@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from datetime import datetime
@@ -61,6 +62,38 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".ts", ".m2ts", ".mts"}
 _START_TIME_RE = re.compile(r"_(\d{8})_(\d{6})(?:\D|$)")
 _MAX_PROBE_LOOKBACK_SEC = 3 * 3600  # 番組尺の上限想定（事前絞り込み用）
 
+# 2時間動画でも通常1時間未満で分析が終わるため、これを超えたら
+# Whisper/OCR並列処理のGPUデッドロック等によるハングと判断する。
+_PROCESS_TIMEOUT_SEC = 2 * 3600  # 2時間
+_HUNG_VIDEOS_LOG = Path("hung_videos.txt")
+
+
+def _load_hung_videos() -> set[str]:
+    if not _HUNG_VIDEOS_LOG.exists():
+        return set()
+    return {
+        line.strip()
+        for line in _HUNG_VIDEOS_LOG.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def _mark_hung_and_die(s3_key: str) -> None:
+    """タイムアウトwatchdogから呼ばれる。ハングしたキーを記録し、プロセス自体を強制終了する。
+
+    GPU/CUDAレベルのデッドロックはスレッドの中断では解消できないため、プロセスを
+    os._exit()で即終了する。run_worker_loop.ps1のsupervisorが30秒後に自動再起動する。
+    """
+    try:
+        log.error(
+            "処理タイムアウト(%d秒超過)によりハングと判断、プロセスを強制終了します: %s",
+            _PROCESS_TIMEOUT_SEC, s3_key,
+        )
+        with open(_HUNG_VIDEOS_LOG, "a", encoding="utf-8") as f:
+            f.write(s3_key + "\n")
+    finally:
+        os._exit(1)
+
 
 def _parse_time_windows(spec: str) -> list[tuple[int, int]]:
     """'05:30-08:30,15:30-19:00' のような文字列を秒範囲のリストにする。"""
@@ -87,6 +120,14 @@ def _filename_start_sec(s3_key: str) -> int | None:
     hhmmss = match.group(2)
     h, m, s = int(hhmmss[0:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
     return h * 3600 + m * 60 + s
+
+
+def _filename_date(s3_key: str) -> str | None:
+    """ファイル名から放送日(YYYYMMDD)を取り出す。"""
+    match = _START_TIME_RE.search(Path(s3_key).name)
+    if not match:
+        return None
+    return match.group(1)
 
 
 # 処理したい優先順: 日付 → 時間帯(PROCESS_TIME_WINDOWSに書いた順=午前/午後) → チャンネル
@@ -215,6 +256,56 @@ def _overlaps_time_windows(start_sec: int, duration_sec: float, windows: list[tu
     """番組の放送時間帯（ファイル名の開始時刻＋実尺）が指定ウィンドウに重なるか。"""
     end_sec = start_sec + duration_sec
     return any(start_sec < w_end and end_sec > w_start for w_start, w_end in windows)
+
+
+_WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _parse_extra_time_windows(spec: str) -> list[tuple[int, int, int, str]]:
+    """'sat|10:45-11:45|20261001' のような文字列を
+    (weekday(0=mon..6=sun), start_sec, end_sec, since_date) のリストにする。
+
+    指定した曜日・指定日(YYYYMMDD)以降の動画だけを追加で対象にするための特例ウィンドウ。
+    """
+    extra: list[tuple[int, int, int, str]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        day_str, time_str, since = (x.strip() for x in part.split("|"))
+        if day_str.lower() not in _WEEKDAY_NAMES:
+            raise ValueError(f"不正な曜日指定です: {day_str}")
+        weekday = _WEEKDAY_NAMES.index(day_str.lower())
+        start_str, end_str = time_str.split("-")
+        sh, sm = (int(x) for x in start_str.strip().split(":"))
+        eh, em = (int(x) for x in end_str.strip().split(":"))
+        start_sec = sh * 3600 + sm * 60
+        end_sec = eh * 3600 + em * 60
+        if end_sec <= start_sec:
+            raise ValueError(f"不正な時間帯指定です（終了が開始以前）: {part}")
+        extra.append((weekday, start_sec, end_sec, since))
+    return extra
+
+
+def _effective_windows(s3_key: str, windows: list[tuple[int, int]] | None) -> list[tuple[int, int]]:
+    """通常のwindowsに、曜日・日付条件を満たす場合だけ特例ウィンドウを合成する。"""
+    effective = list(windows) if windows else []
+    if not settings.process_time_windows_extra:
+        return effective
+
+    broadcast_date = _filename_date(s3_key)
+    if broadcast_date is None:
+        return effective
+
+    try:
+        weekday = datetime.strptime(broadcast_date, "%Y%m%d").weekday()
+    except ValueError:
+        return effective
+
+    for w_day, w_start, w_end, since in _parse_extra_time_windows(settings.process_time_windows_extra):
+        if weekday == w_day and broadcast_date >= since:
+            effective.append((w_start, w_end))
+    return effective
 
 
 def _build_boto_session() -> boto3.Session:
@@ -422,7 +513,14 @@ def _build_html_report(filename: str, corners: list[dict], audio_rows: list[dict
 </html>"""
 
 
-def _process_s3_object(s3_key: str) -> None:
+def _process_s3_object(
+    s3_key: str, allow_hung: bool = False, bypass_time_filter: bool = False,
+) -> None:
+    """allow_hung=Trueの場合、過去にハングしたとして記録された動画でも処理を試みる
+    （他に未処理の対象が無くなった場合に、backfill.py側から明示的に指定される）。
+    bypass_time_filter=Trueの場合、放送時間帯フィルタ(PROCESS_TIME_WINDOWS系)を無視して
+    必ず処理する（視聴率ダッシュボード等から明示的にリクエストされた動画向け）。
+    尺上限・全黒判定の安全チェックはbypass_time_filterでも適用される。"""
     session = _build_boto_session()
     s3 = session.client("s3")
 
@@ -431,13 +529,20 @@ def _process_s3_object(s3_key: str) -> None:
         log.info("スキップ（動画以外）: %s", s3_key)
         return
 
+    if not allow_hung and s3_key in _load_hung_videos():
+        log.warning("スキップ（過去に処理がハングしたため対象外）: %s", s3_key)
+        return
+
     # 事前チェックは動画の読み取り量が少ない順に行う(時間帯外の動画にまで黒判定のフレーム取得をしないため):
     # ファイル名だけで時間帯判定 → ffprobeで尺を1回だけ取得 → 尺上限・時間帯判定 → 黒判定(フレームを最大6回読む)
-    windows = _parse_time_windows(settings.process_time_windows) if settings.process_time_windows else None
     start_sec = _filename_start_sec(s3_key)  # 読めない場合は時間帯フィルタの対象外にせず処理する
-    if windows and start_sec is not None and not _may_overlap_time_windows(start_sec, windows):
-        log.info("スキップ（時間帯フィルタ対象外）: %s", s3_key)
-        return
+    windows = None
+    if not bypass_time_filter:
+        base_windows = _parse_time_windows(settings.process_time_windows) if settings.process_time_windows else None
+        windows = _effective_windows(s3_key, base_windows) if (base_windows or settings.process_time_windows_extra) else None
+        if windows and start_sec is not None and not _may_overlap_time_windows(start_sec, windows):
+            log.info("スキップ（時間帯フィルタ対象外）: %s", s3_key)
+            return
 
     if settings.max_video_duration_sec or windows:
         url = _video_source_url(s3, s3_key)
@@ -464,51 +569,57 @@ def _process_s3_object(s3_key: str) -> None:
 
     log.info("処理開始: s3://%s/%s", settings.s3_bucket, s3_key)
 
-    with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmpdir:
-        local_video = Path(tmpdir) / Path(s3_key).name
-        log.info("ダウンロード中...")
-        _download_video(s3, s3_key, local_video)
-        log.info("ダウンロード完了: %s", local_video)
+    watchdog = threading.Timer(_PROCESS_TIMEOUT_SEC, _mark_hung_and_die, args=(s3_key,))
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        with tempfile.TemporaryDirectory(dir="A:\\tmp") as tmpdir:
+            local_video = Path(tmpdir) / Path(s3_key).name
+            log.info("ダウンロード中...")
+            _download_video(s3, s3_key, local_video)
+            log.info("ダウンロード完了: %s", local_video)
 
-        analyzed = segment_corners(local_video)
+            analyzed = segment_corners(local_video)
 
-        corners = analyzed.get("corners", [])
-        audio_rows = analyzed.get("audio_rows", [])
-        ocr_rows = analyzed.get("ocr_rows", [])
-        cost = _calc_cost(analyzed.get("gemini_usage"))
-        log.info("コーナー数: %d  Gemini: %dトークン 約%.2f円", len(corners), cost["total_tokens"], cost["cost_jpy"])
+            corners = analyzed.get("corners", [])
+            audio_rows = analyzed.get("audio_rows", [])
+            ocr_rows = analyzed.get("ocr_rows", [])
+            cost = _calc_cost(analyzed.get("gemini_usage"))
+            log.info("コーナー数: %d  Gemini: %dトークン 約%.2f円", len(corners), cost["total_tokens"], cost["cost_jpy"])
 
-        filename = Path(s3_key).name
+            filename = Path(s3_key).name
 
-        csv_key = _build_output_key(s3_key, "_corners.csv")
-        s3.put_object(
-            Bucket=settings.s3_bucket,
-            Key=csv_key,
-            Body=_corners_to_csv(s3_key, corners).encode("utf-8-sig"),
-            ContentType="text/csv; charset=utf-8",
-        )
-        log.info("CSV出力完了: s3://%s/%s", settings.s3_bucket, csv_key)
+            csv_key = _build_output_key(s3_key, "_corners.csv")
+            s3.put_object(
+                Bucket=settings.s3_bucket,
+                Key=csv_key,
+                Body=_corners_to_csv(s3_key, corners).encode("utf-8-sig"),
+                ContentType="text/csv; charset=utf-8",
+            )
+            log.info("CSV出力完了: s3://%s/%s", settings.s3_bucket, csv_key)
 
-        html_key = _build_output_key(
-            s3_key,
-            "_report.html",
-            prefix=settings.s3_report_prefix,
-        )
-        s3.put_object(
-            Bucket=settings.s3_bucket,
-            Key=html_key,
-            Body=_build_html_report(filename, corners, audio_rows, ocr_rows, cost).encode("utf-8"),
-            ContentType="text/html; charset=utf-8",
-        )
-        log.info("HTML出力完了: s3://%s/%s", settings.s3_bucket, html_key)
+            html_key = _build_output_key(
+                s3_key,
+                "_report.html",
+                prefix=settings.s3_report_prefix,
+            )
+            s3.put_object(
+                Bucket=settings.s3_bucket,
+                Key=html_key,
+                Body=_build_html_report(filename, corners, audio_rows, ocr_rows, cost).encode("utf-8"),
+                ContentType="text/html; charset=utf-8",
+            )
+            log.info("HTML出力完了: s3://%s/%s", settings.s3_bucket, html_key)
 
-        parquet_key, daily_row_count = _update_daily_parquet_with_retry(s3_key, csv_key)
-        log.info(
-            "日次Parquet更新完了: %d件 s3://%s/%s",
-            daily_row_count,
-            settings.s3_bucket,
-            parquet_key,
-        )
+            parquet_key, daily_row_count = _update_daily_parquet_with_retry(s3_key, csv_key)
+            log.info(
+                "日次Parquet更新完了: %d件 s3://%s/%s",
+                daily_row_count,
+                settings.s3_bucket,
+                parquet_key,
+            )
+    finally:
+        watchdog.cancel()
 
 
 def _parse_s3_records(body: str) -> list[str]:
