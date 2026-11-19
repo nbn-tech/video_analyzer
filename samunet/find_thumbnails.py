@@ -33,6 +33,11 @@ SAT_TH = 30.0   # 平均彩度（max-min）。銀色の背景は低い
 MIN_RUN_SEC = 1.0
 DUP_TH = 12.0   # 縮小したサムネ同士の平均色差。これ未満は同じサムネとみなす
 
+# 額縁の左右の金の枠（1920x1080 基準）。下の角はワイプが重なるので上の方だけ見る
+FRAME_BORDERS = ("24:220:212:300", "24:220:1684:300")
+GOLD_MIN_R = 150    # 金の枠の平均 R の下限
+GOLD_MIN_RB = 55    # 金の枠の平均 (R - B) の下限。銀・灰色・空などは小さい
+
 
 def _dist(a: bytes, b: bytes) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
@@ -79,6 +84,18 @@ def _tiny_thumb(video: Path, sec: float) -> bytes:
     return subprocess.run(cmd, check=True, capture_output=True).stdout
 
 
+def _has_gold_frame(video: Path, sec: float) -> bool:
+    """左右の枠がどちらも金色なら True。上の帯だけ似ている別の画面（ロケ・告知など）を除く。"""
+    for crop in FRAME_BORDERS:
+        cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-ss", f"{sec:.2f}", "-i", str(video),
+               "-frames:v", "1", "-vf", f"scale=1920:1080,crop={crop},scale=1:1,format=rgb24",
+               "-f", "rawvideo", "-"]
+        r, _g, b = subprocess.run(cmd, check=True, capture_output=True).stdout[:3]
+        if r < GOLD_MIN_R or r - b < GOLD_MIN_RB:
+            return False
+    return True
+
+
 def _save_thumb(video: Path, sec: float, dest: Path) -> None:
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-ss", f"{sec:.2f}", "-i", str(video),
            "-frames:v", "1", "-vf", f"scale=1920:1080,{THUMB_CROP}", "-q:v", "2", str(dest)]
@@ -102,6 +119,9 @@ def main() -> None:
     kept: list[dict] = []
     for start, end in runs:
         mid = (start + end) / 2  # 表示し始めのズーム演出を避けて真ん中のフレームを使う
+        if not _has_gold_frame(video, mid):
+            print(f"  除外（金の枠なし）: {int(start//60):02d}:{start%60:04.1f} - {int(end//60):02d}:{end%60:04.1f}")
+            continue
         tiny = _tiny_thumb(video, mid)
         dup = next((k for k in kept if _dist(k["_tiny"], tiny) < DUP_TH), None)
         if dup is not None:

@@ -37,6 +37,14 @@ def main() -> None:
     sys.path.insert(0, str(REPO_ROOT))
     from app import services
 
+    s = services.settings
+    print(
+        f"設定: whisper_model={s.whisper_model}  ocr_enabled={s.ocr_enabled}  "
+        f"ocr_engine={s.ocr_engine}  ocr_interval_sec={s.ocr_interval_sec}"
+    )
+    if not s.ocr_enabled or float(s.ocr_interval_sec) <= 0:
+        print("警告: OCR が無効の設定です（ocr_enabled / ocr_interval_sec）。ocr_rows は空になります。")
+
     t0 = time.time()
     print(f"開始: {video}")
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -56,6 +64,10 @@ def main() -> None:
     )
     print(f"完了: {elapsed/60:.1f}分  audio_rows={len(audio_rows)}  ocr_rows={len(ocr_rows)}")
     print(f"出力: {out_dir}")
+    if not ocr_rows:
+        print("警告: OCR の結果が0件です。設定（.env / .env.local）とログの 'OCR skipped' を確認してください。")
+    if not audio_rows:
+        print("警告: 文字起こしの結果が0件です。")
 
 
 if __name__ == "__main__":
