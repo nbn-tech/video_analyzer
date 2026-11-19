@@ -1,0 +1,69 @@
+{
+ "video": "#80.mp4",
+ "thumbnails": [
+  {
+   "index": 1,
+   "file": "thumb_01.jpg",
+   "start_sec": 170.0,
+   "end_sec": 175.5,
+   "capture_sec": 172.75,
+   "also_shown": []
+  },
+  {
+   "index": 2,
+   "file": "thumb_02.jpg",
+   "start_sec": 383.5,
+   "end_sec": 388.0,
+   "capture_sec": 385.75,
+   "also_shown": []
+  },
+  {
+   "index": 3,
+   "file": "thumb_03.jpg",
+   "start_sec": 1102.5,
+   "end_sec": 1107.5,
+   "capture_sec": 1105.0,
+   "also_shown": []
+  },
+  {
+   "index": 4,
+   "file": "thumb_04.jpg",
+   "start_sec": 1323.0,
+   "end_sec": 1329.0,
+   "capture_sec": 1326.0,
+   "also_shown": []
+  },
+  {
+   "index": 5,
+   "file": "thumb_05.jpg",
+   "start_sec": 1713.5,
+   "end_sec": 1723.5,
+   "capture_sec": 1718.5,
+   "also_shown": []
+  },
+  {
+   "index": 6,
+   "file": "thumb_06.jpg",
+   "start_sec": 2117.0,
+   "end_sec": 2123.0,
+   "capture_sec": 2120.0,
+   "also_shown": []
+  },
+  {
+   "index": 7,
+   "file": "thumb_07.jpg",
+   "start_sec": 2474.0,
+   "end_sec": 2483.0,
+   "capture_sec": 2478.5,
+   "also_shown": []
+  },
+  {
+   "index": 8,
+   "file": "thumb_08.jpg",
+   "start_sec": 2872.5,
+   "end_sec": 2877.0,
+   "capture_sec": 2874.75,
+   "also_shown": []
+  }
+ ]
+}

@@ -1,0 +1,21 @@
+{
+ "video": "#02.mp4",
+ "thumbnails": [
+  {
+   "index": 1,
+   "file": "thumb_01.jpg",
+   "start_sec": 208.5,
+   "end_sec": 215.0,
+   "capture_sec": 211.75,
+   "also_shown": []
+  },
+  {
+   "index": 2,
+   "file": "thumb_02.jpg",
+   "start_sec": 399.5,
+   "end_sec": 408.0,
+   "capture_sec": 403.75,
+   "also_shown": []
+  }
+ ]
+}

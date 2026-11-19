@@ -1,0 +1,69 @@
+{
+ "video": "Chocolate-Thumbnet-126-honhen-Kan1118.mp4",
+ "thumbnails": [
+  {
+   "index": 1,
+   "file": "thumb_01.jpg",
+   "start_sec": 121.0,
+   "end_sec": 126.5,
+   "capture_sec": 123.75,
+   "also_shown": []
+  },
+  {
+   "index": 2,
+   "file": "thumb_02.jpg",
+   "start_sec": 556.0,
+   "end_sec": 566.0,
+   "capture_sec": 561.0,
+   "also_shown": []
+  },
+  {
+   "index": 3,
+   "file": "thumb_03.jpg",
+   "start_sec": 992.0,
+   "end_sec": 998.5,
+   "capture_sec": 995.25,
+   "also_shown": []
+  },
+  {
+   "index": 4,
+   "file": "thumb_04.jpg",
+   "start_sec": 1411.5,
+   "end_sec": 1418.0,
+   "capture_sec": 1414.75,
+   "also_shown": []
+  },
+  {
+   "index": 5,
+   "file": "thumb_05.jpg",
+   "start_sec": 1640.5,
+   "end_sec": 1648.5,
+   "capture_sec": 1644.5,
+   "also_shown": []
+  },
+  {
+   "index": 6,
+   "file": "thumb_06.jpg",
+   "start_sec": 2097.5,
+   "end_sec": 2103.5,
+   "capture_sec": 2100.5,
+   "also_shown": []
+  },
+  {
+   "index": 7,
+   "file": "thumb_07.jpg",
+   "start_sec": 2565.5,
+   "end_sec": 2574.0,
+   "capture_sec": 2569.75,
+   "also_shown": []
+  },
+  {
+   "index": 8,
+   "file": "thumb_08.jpg",
+   "start_sec": 2902.5,
+   "end_sec": 2908.5,
+   "capture_sec": 2905.5,
+   "also_shown": []
+  }
+ ]
+}

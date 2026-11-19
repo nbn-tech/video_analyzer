@@ -1,0 +1,16 @@
+# 作業用の出力はリポジトリに入れない（sample_data/ は開発用に入れる。リポジトリは非公開の前提）
+/site_data/
+/rows/
+/thumbs/
+/probe_out/
+
+# 動画
+*.mp4
+*.mov
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
